@@ -5,3 +5,5 @@ dist/
 *.db-wal
 .env
 .env.local
+card-bot.db-shm
+card-bot.db-wal
