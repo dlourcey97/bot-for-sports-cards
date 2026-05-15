@@ -271,6 +271,9 @@ export function runDryRun(taskId: number): void {
           cardExpiry: profile.cardExpiry,
           cardCvv: profile.cardCvv,
           cardName: profile.cardName,
+          bestbuyCookies: profile.bestbuyCookies,
+          toppsCookies: profile.toppsCookies,
+          proxyUrl: profile.proxyUrl,
         },
         log,
         abortController.signal

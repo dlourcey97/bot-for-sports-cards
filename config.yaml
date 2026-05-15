@@ -1,50 +1,25 @@
-# ============================================================
-# CARD BOT CONFIG — Fill in your info and run:
-#   npx tsx packages/bot/src/main.ts load-config config.yaml
-# ============================================================
-
-# Your profile (retailer login + shipping + payment)
 profile:
-  # Retailer login
-  email: "your-email@gmail.com"
-  password: "your-password"
-
-  # Shipping address
-  firstName: "John"
-  lastName: "Doe"
-  phone: "555-123-4567"
-  address1: "123 Main St"
-  address2: ""                   # optional — leave blank if none
+  email: "dean.lourcey@gmail.com"
+  password: "Dazzle97!dean"
+  firstName: "Dean"
+  lastName: "Lourcey"
+  phone: "214-717-2303"
+  address1: "2808 McKinney Ave APT 740"
+  address2: ""
   city: "Dallas"
   state: "TX"
-  zip: "75001"
+  zip: "75204"
+  cardNumber: "5524860356527914"
+  cardExpiry: "08/27"
+  cardCvv: "545"
+  cardName: "Dean Lourcey"
+  bestbuyCookies: '[{"domain":".bestbuy.com","name":"AMCV_F6301253512D2BDB0A490D45%40AdobeOrg","path":"/","secure":false,"value":"1585540135%7CMCMID%7C26653981854564626011237253870014021981%7CMCAAMLH-1776810291%7C9%7CMCAAMB-1776810291%7CRKhpRz8krg2tLO6pguXWp5olkAcUniQYPHaMWWgdJ3xzPWQmdj0y%7CMCOPTOUT-1776212691s%7CNONE%7CMCAID%7CNONE%7CvVersion%7C4.4.0"},{"domain":".bestbuy.com","name":"UID","path":"/","secure":false,"value":"beac2c34-37a1-4a13-a82a-14ebfcf1d6ad"},{"domain":".bestbuy.com","name":"at","path":"/","secure":true,"httpOnly":true,"sameSite":"Lax","value":"eyJhY2Nlc3NUb2tlbiI6IllXTXRBczVfeVRoUkVmR3pTd0psemppcnBSX2R1emlfNnUzYWRJYldWcXBlcU90cngxeUpBQUFBQUFBQUFBQSIsInRpbWVUb0xpdmUiOjE4MDAsImlzc3VlZFRpbWVzdGFtcCI6MTc3NjIwNTYwMTU3OSwiYXNzZXJ0aW9uIjoidTp5ZjlnSGg1a01kSGcxMlhyN19qdFIza0Y4LVRlNzhKZUdCVEstdEhDYjh3IiwicHJpbmNpcGFsIjoidTp5ZjlnSGg1a01kSGcxMlhyN19qdFIza0Y4LVRlNzhKZUdCVEstdEhDYjh3IiwicHJpbmNpcGFsSWRlbnRpZmllciI6IjkzOWFhYjk1LTRlNjMtMTFlZS04ZDJlLTBlY2QxOTI4ZTFjZCIsImNvbnN1bWFibGUiOmZhbHNlLCJ2ZXJzaW9uIjoiMS4wIiwib2YiOiJaakk0T1RjeU5URXhNREE1TkRka1lXRmlZVEkyT1RCbE5XWmtaamhtTVdRIiwib2ZQb2xpY3kiOiJLR2FGYVRnRXJ1VVhNY2JTazJCdTlSOS0yaXEwNGNfTUNsb0hMZXJ1ZmRJIiwiYVRpbWVzdGFtcCI6MTc3NjIwNTYwMTU3OSwiY3ZydCI6ZmFsc2UsInJ0cmlkIjoiWkRkbU5qZGxZell0Tm1Sak1TMDBabUV4TFdGbVlqTXRZVFJpWXpjMFlUbGxPRGM0In0.ZAWjZGEtHEAbpkkffVH9pEKO0AOHl7zVu-CZT7W9x8ciEZIBmv8aqjXezZV82HGvyqa9oQNwU7sTYf3MQejguw"},{"domain":".bestbuy.com","name":"customerZipCode","path":"/","secure":false,"value":"75201|N"},{"domain":".bestbuy.com","name":"CTT","path":"/","secure":false,"value":"29e8b7df34f3cf31b7d2936a375a06a7"},{"domain":".bestbuy.com","name":"pt","path":"/","secure":false,"value":"3517763757"},{"domain":".bestbuy.com","name":"SID","path":"/","secure":false,"value":"0459f61d-ccb8-4c0a-b5be-bf5b8c63962e"},{"domain":".bestbuy.com","name":"DYN_USER_CONFIRM","path":"/","secure":false,"httpOnly":true,"sameSite":"Lax","value":"c9b4a4ba0702b68df1975ffc2185f8bf"},{"domain":".bestbuy.com","name":"DYN_USER_ID","path":"/","secure":false,"httpOnly":true,"sameSite":"Lax","value":"ATG49541321377"},{"domain":".bestbuy.com","name":"par","path":"/","secure":true,"httpOnly":true,"sameSite":"Lax","value":"d7f67ec6-6dc1-4fa1-afb3-a4bc74a9e878"},{"domain":".bestbuy.com","name":"ut","path":"/","secure":true,"sameSite":"Lax","value":"939aab95-4e63-11ee-8d2e-0ecd1928e1cd"},{"domain":".bestbuy.com","name":"locStoreId","path":"/","secure":false,"value":"58"},{"domain":".bestbuy.com","name":"locDestZip","path":"/","secure":false,"value":"75231"},{"domain":".bestbuy.com","name":"s_ecid","path":"/","secure":false,"sameSite":"Lax","value":"MCMID%7C26653981854564626011237253870014021981"},{"domain":".bestbuy.com","name":"_abck","path":"/","secure":true,"value":"EF3BEC0210741A9499A5C4B480F7CEB1~0~YAAQyiXAF02VtSaeAQAA/pjILA8U334SsGKkL194RRBeUHcdnkuO4LcxY7x+EqJzQ5N47dehO6+473u4RD/7jXcKhArl3QusEzunSwGcQILvjOzYd1lm6oGIXkX7K723Usm2qRPy+G66NfFEys06ancRHAADf81CFxRmbB4W3QHDJTFtbUfRc3Y40L8i+S/JmZIBiR72uNgPVtdN829EHaBxTQQ5s2l7ZiRClF7Hh+Kl78OhzLi+oXtSzQiVddtjSkMNYUvhejphYndIaGdKyZlfKKmkmwTcyHhewZACKPErPcoPspD7j2Hbg5IY8m5Ri9jjVw3R4Whb/bI+dlL+7muL8PycThr1HgMHNXmsOCuXyVvpM7pjwP7omeCJKQM4Db3b15bzEHHNkaUVTo4XW8CbZFcasWRDsA3+neciwRSjxDiMmt7PCEFSrl3UK8DnUAJTIDilnlEUzHzeja/sRYPF/qNfKJ9vucZgNsn7pnUZ8GeEfa54hFscJbbJMl4xpSMKF3Ja423QU1WDm9FSHxNZuMrDAEzbm6a2PPqEPHJ3sLryG1aWzY1va+51RJBKRocLphC82v7dCLf1W895iCp4VaHOy7d/jyz8qofRJ1KdFJJYEg5fRbeXMZ7vsgB92a4JMxmJzCJH914Pz+FrUIIIAlkyYLxHDASZ9SVIHvbXZOApyA1ntak5wr3kdmIim9eEoJYClq9QwrxDslkVWz02gUxzHVEiLWtbA0awJRY18DA9nN/ifA1NUtu0lyFxvBxgESAapBXsNZ2Ec0Wsr+LJKXgFt8LuILwrARzwppzkvsSv30BWzlN+ak6Pn7ZB2LrB3JM7lwGfl6MKT9sed57nCfSSHK+2Gx3A7LKbsthJCH3bU/+lgpHJ6hNdlefGP3AFW1DR/Is=~-1~-1~1778870890~AAQAAAAF%2f%2f%2f%2f%2f88A2E0FMhpQEcW%2ftH4yRyiyn+sUzGCp11QcHY5tT1keWb%2f8GOHIyYdP5MJrj8lTwDFQvcWOjIzxdLrkIXpXUHxHJ7BYxtrUklHr~-1"},{"domain":".bestbuy.com","name":"ZPLANK","path":"/","secure":true,"httpOnly":true,"sameSite":"Lax","value":"f75e4a34cf6a47eeba1acbcf65467d2e"},{"domain":".bestbuy.com","name":"connectId","path":"/","secure":true,"sameSite":"None","value":"{\"connectId\":\"GfxhUFs8KBV9Vmgtw_cfgizjVfhOsciNpOo2Ba9XUNeiAVndpoMPGYtiAZs469vMyzPLeEzbOh4d3K6vic-Bvg\",\"puid\":\"abf78d3358ef354c772942c9e1ad012122d8421bcbcf7f8c07e174f56f0b5600\",\"ttl\":86400000,\"lastUsed\":1778867313892,\"lastSynced\":1778867313892}"},{"domain":".bestbuy.com","name":"vt","path":"/","secure":false,"value":"2fb79446-382d-11f1-9cb1-06bf16796d43"},{"domain":".bestbuy.com","name":"ui","path":"/","secure":false,"sameSite":"Lax","value":"1776205590261"},{"domain":".bestbuy.com","name":"pst2","path":"/","secure":false,"value":"58|N"},{"domain":".bestbuy.com","name":"physical_dma","path":"/","secure":false,"value":"623"},{"domain":".bestbuy.com","name":"bby_rdp","path":"/","secure":false,"value":"l"},{"domain":".bestbuy.com","name":"isGridViewEnabled","path":"/","secure":false,"value":"true"},{"domain":".bestbuy.com","name":"COM_TEST_FIX","path":"/","secure":false,"value":"2026-05-15T17%3A48%3A35.902Z"},{"domain":".bestbuy.com","name":"_gcl_au","path":"/","secure":false,"value":"1.1.2075003643.1776190229"}]'
+  toppsCookies: ""
+  proxyUrl: ""
 
-  # Payment card
-  cardNumber: "4111111111111111"
-  cardExpiry: "12/28"            # MM/YY format
-  cardCvv: "123"
-  cardName: "John Doe"
-
-  # Session cookies (optional but HIGHLY recommended for speed)
-  # Export cookies from your browser as JSON after logging in
-  # Use a browser extension like "EditThisCookie" or "Cookie-Editor"
-  bestbuyCookies: ""             # paste JSON array string here
-  toppsCookies: ""               # paste JSON array string here
-
-  # Proxy (optional — residential proxy helps avoid IP blocks)
-  proxyUrl: ""                   # e.g. "http://user:pass@proxy.decodo.com:7777"
-
-# Tasks — add as many as you want
 tasks:
-  - site: "bestbuy"             # "bestbuy" | "topps" | "dicks"
+  - site: "bestbuy"
     keywords: "trading cards hobby box"
-    productUrl: "https://www.bestbuy.com/site/some-product/1234567"
+    productUrl: "https://www.bestbuy.com/site/upper-deck-2024-25-nba-hobby-trading-cards/6609498.p?skuId=6609498"
     quantity: 1
-    maxPrice: null               # optional — skip items above this price (Topps only)
-
-  # Example: add a second task for Topps
-  # - site: "topps"
-  #   keywords: "2025 bowman chrome"
-  #   productUrl: "https://www.topps.com/products/some-drop"
-  #   quantity: 2
-  #   maxPrice: 250.00
+    maxPrice: null

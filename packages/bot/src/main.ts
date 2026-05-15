@@ -235,7 +235,13 @@ async function main() {
       logger.info({ taskId, site: task.site }, "Starting dry run...");
       await db.update(tasksTable).set({ status: "testing" }).where(eq(tasksTable.id, taskId));
       runDryRun(taskId);
-      await new Promise((r) => setTimeout(r, 5000));
+      // Wait for dry run to complete (check status every 2s, max 120s)
+      for (let i = 0; i < 60; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const [check] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId));
+        if (check && check.status === "idle") break;
+      }
+      await new Promise((r) => setTimeout(r, 1000)); // let final logs flush
       const logs = await db.select().from(botLogsTable).where(eq(botLogsTable.taskId, taskId));
       for (const log of logs) {
         logger.info(`[${log.level}] ${log.message}`);
