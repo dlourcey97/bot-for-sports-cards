@@ -1,9 +1,6 @@
 # ============================================================
 # CARD BOT CONFIG — Fill in your info and run:
 #   npx tsx packages/bot/src/main.ts load-config config.yaml
-#
-# For CAPTCHA solving, set this env var before running:
-#   export CAPSOLVER_API_KEY="CAP-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 # ============================================================
 
 # Your profile (retailer login + shipping + payment)
