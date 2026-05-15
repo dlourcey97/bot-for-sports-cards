@@ -1,0 +1,50 @@
+# ============================================================
+# CARD BOT CONFIG — Fill in your info and run:
+#   npx tsx packages/bot/src/main.ts load-config config.yaml
+# ============================================================
+
+# Your profile (retailer login + shipping + payment)
+profile:
+  # Retailer login
+  email: "your-email@gmail.com"
+  password: "your-password"
+
+  # Shipping address
+  firstName: "John"
+  lastName: "Doe"
+  phone: "555-123-4567"
+  address1: "123 Main St"
+  address2: ""                   # optional — leave blank if none
+  city: "Dallas"
+  state: "TX"
+  zip: "75001"
+
+  # Payment card
+  cardNumber: "4111111111111111"
+  cardExpiry: "12/28"            # MM/YY format
+  cardCvv: "123"
+  cardName: "John Doe"
+
+  # Session cookies (optional but HIGHLY recommended for speed)
+  # Export cookies from your browser as JSON after logging in
+  # Use a browser extension like "EditThisCookie" or "Cookie-Editor"
+  bestbuyCookies: ""             # paste JSON array string here
+  toppsCookies: ""               # paste JSON array string here
+
+  # Proxy (optional — residential proxy helps avoid IP blocks)
+  proxyUrl: ""                   # e.g. "http://user:pass@proxy.decodo.com:7777"
+
+# Tasks — add as many as you want
+tasks:
+  - site: "bestbuy"             # "bestbuy" | "topps" | "dicks"
+    keywords: "trading cards hobby box"
+    productUrl: "https://www.bestbuy.com/site/some-product/1234567"
+    quantity: 1
+    maxPrice: null               # optional — skip items above this price (Topps only)
+
+  # Example: add a second task for Topps
+  # - site: "topps"
+  #   keywords: "2025 bowman chrome"
+  #   productUrl: "https://www.topps.com/products/some-drop"
+  #   quantity: 2
+  #   maxPrice: 250.00

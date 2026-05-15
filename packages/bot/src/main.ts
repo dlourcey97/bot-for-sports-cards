@@ -1,5 +1,7 @@
+import { readFileSync } from "node:fs";
 import { db, initDb, tasksTable, profilesTable, botLogsTable } from "@workspace/db";
 import { eq, desc } from "drizzle-orm";
+import { parse as parseYaml } from "yaml";
 import { startBot, stopBot, isRunning, runDryRun } from "./botRunner.js";
 import { logger } from "./logger.js";
 
@@ -7,6 +9,153 @@ initDb();
 
 const args = process.argv.slice(2);
 const command = args[0] ?? "status";
+
+interface ConfigProfile {
+  email: string;
+  password: string;
+  firstName: string;
+  lastName: string;
+  phone: string;
+  address1: string;
+  address2?: string;
+  city: string;
+  state: string;
+  zip: string;
+  cardNumber: string;
+  cardExpiry: string;
+  cardCvv: string;
+  cardName: string;
+  bestbuyCookies?: string;
+  toppsCookies?: string;
+  proxyUrl?: string;
+}
+
+interface ConfigTask {
+  site: string;
+  keywords: string;
+  productUrl?: string;
+  quantity: number;
+  maxPrice?: number | null;
+}
+
+interface Config {
+  profile: ConfigProfile;
+  tasks: ConfigTask[];
+}
+
+function maskCard(num: string): string {
+  return `**** **** **** ${num.replace(/\s/g, "").slice(-4)}`;
+}
+
+async function loadConfig(configPath: string) {
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf-8");
+  } catch {
+    logger.error(`Could not read config file: ${configPath}`);
+    process.exit(1);
+  }
+
+  let config: Config;
+  try {
+    config = parseYaml(raw) as Config;
+  } catch (e) {
+    logger.error(`Invalid YAML in ${configPath}: ${e instanceof Error ? e.message : e}`);
+    process.exit(1);
+  }
+
+  if (!config.profile) {
+    logger.error("Config file missing 'profile' section");
+    process.exit(1);
+  }
+  if (!config.tasks || config.tasks.length === 0) {
+    logger.error("Config file missing 'tasks' section (need at least one task)");
+    process.exit(1);
+  }
+
+  const p = config.profile;
+  const required: Array<[string, unknown]> = [
+    ["email", p.email], ["password", p.password],
+    ["firstName", p.firstName], ["lastName", p.lastName],
+    ["phone", p.phone], ["address1", p.address1],
+    ["city", p.city], ["state", p.state], ["zip", p.zip],
+    ["cardNumber", p.cardNumber], ["cardExpiry", p.cardExpiry],
+    ["cardCvv", p.cardCvv], ["cardName", p.cardName],
+  ];
+  for (const [name, val] of required) {
+    if (!val || String(val).trim() === "") {
+      logger.error(`Profile field '${name}' is required but empty`);
+      process.exit(1);
+    }
+  }
+
+  for (const [i, t] of config.tasks.entries()) {
+    if (!t.site || !["bestbuy", "topps", "dicks"].includes(t.site)) {
+      logger.error(`Task ${i + 1}: 'site' must be "bestbuy", "topps", or "dicks"`);
+      process.exit(1);
+    }
+    if (!t.keywords && !t.productUrl) {
+      logger.error(`Task ${i + 1}: need at least 'keywords' or 'productUrl'`);
+      process.exit(1);
+    }
+  }
+
+  logger.info("Config validated — loading into database...");
+
+  const [inserted] = await db.insert(profilesTable).values({
+    email: p.email,
+    password: p.password,
+    firstName: p.firstName,
+    lastName: p.lastName,
+    phone: p.phone,
+    address1: p.address1,
+    address2: p.address2 || null,
+    city: p.city,
+    state: p.state,
+    zip: p.zip,
+    cardNumber: p.cardNumber,
+    cardExpiry: p.cardExpiry,
+    cardCvv: p.cardCvv,
+    cardName: p.cardName,
+    bestbuyCookies: p.bestbuyCookies || null,
+    toppsCookies: p.toppsCookies || null,
+    proxyUrl: p.proxyUrl || null,
+  }).returning();
+
+  const profileId = inserted.id;
+  logger.info(`Profile created: ${p.firstName} ${p.lastName} (${p.email}) — card ${maskCard(p.cardNumber)}`);
+
+  if (p.bestbuyCookies) logger.info("  Best Buy cookies: loaded");
+  if (p.toppsCookies) logger.info("  Topps cookies: loaded");
+  if (p.proxyUrl) logger.info(`  Proxy: ${p.proxyUrl.replace(/:[^:@]+@/, ":***@")}`);
+
+  const taskIds: number[] = [];
+  for (const t of config.tasks) {
+    const [task] = await db.insert(tasksTable).values({
+      profileId,
+      site: t.site,
+      keywords: t.keywords || "",
+      productUrl: t.productUrl || null,
+      quantity: t.quantity || 1,
+      maxPrice: t.maxPrice ?? null,
+      status: "idle",
+    }).returning();
+    taskIds.push(task.id);
+    logger.info(`Task #${task.id} created: ${t.site} — "${t.keywords || t.productUrl}" × ${t.quantity || 1}`);
+  }
+
+  console.log("");
+  console.log("  All set! Next steps:");
+  console.log("");
+  for (const id of taskIds) {
+    console.log(`    npx tsx packages/bot/src/main.ts dry-run ${id}   # test checkout flow`);
+  }
+  console.log("");
+  for (const id of taskIds) {
+    console.log(`    npx tsx packages/bot/src/main.ts start ${id}     # go live`);
+  }
+  console.log("");
+}
 
 async function main() {
   switch (command) {
@@ -21,7 +170,7 @@ async function main() {
         );
       }
       if (tasks.length === 0) {
-        logger.info("No tasks configured. Use 'seed' command to create a demo profile and task.");
+        logger.info("No tasks configured. Use 'load-config config.yaml' to get started.");
       }
       break;
     }
@@ -58,6 +207,17 @@ async function main() {
         status: "idle",
       });
       logger.info("Demo profile and task created. Run 'dry-run 1' to test.");
+      break;
+    }
+
+    case "load-config": {
+      const configPath = args[1];
+      if (!configPath) {
+        logger.error("Usage: load-config <path-to-config.yaml>");
+        logger.info("Copy config.example.yaml to config.yaml, fill in your info, then run this command.");
+        process.exit(1);
+      }
+      await loadConfig(configPath);
       break;
     }
 
@@ -113,8 +273,22 @@ async function main() {
     }
 
     default:
-      logger.info("Card Bot CLI");
-      logger.info("Commands: status | seed | dry-run <taskId> | start <taskId> | logs [taskId]");
+      console.log("Card Bot CLI");
+      console.log("");
+      console.log("Commands:");
+      console.log("  load-config <file>   Load profile + tasks from a YAML config file");
+      console.log("  status               Show all profiles and tasks");
+      console.log("  seed                 Create a demo profile and task");
+      console.log("  dry-run <taskId>     Test checkout flow without placing an order");
+      console.log("  start <taskId>       Start sniping (live mode)");
+      console.log("  logs [taskId]        View bot logs");
+      console.log("");
+      console.log("Quick start:");
+      console.log("  1. cp config.example.yaml config.yaml");
+      console.log("  2. Edit config.yaml with your info");
+      console.log("  3. npx tsx packages/bot/src/main.ts load-config config.yaml");
+      console.log("  4. npx tsx packages/bot/src/main.ts dry-run 1");
+      console.log("  5. npx tsx packages/bot/src/main.ts start 1");
   }
 }
 
