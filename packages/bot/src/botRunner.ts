@@ -1,4 +1,4 @@
-import { db, tasksTable, botLogsTable, profilesTable } from "@workspace/db"; // profilesTable used in dry run
+import { db, tasksTable, botLogsTable, profilesTable } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "./logger";
 import { runDicksBot } from "./dicksBot";
@@ -12,14 +12,8 @@ interface ActiveBot {
 }
 
 const activeBots = new Map<number, ActiveBot>();
-
-// Tracks when we last ran the store availability check per task (ms timestamp)
 const lastStoreCheckMap = new Map<number, number>();
 const STORE_CHECK_INTERVAL_MS = 60_000;
-
-// ── Quantity tracking ──────────────────────────────────────────────────────
-// Tracks how many units have been purchased so far for each running task.
-// Reset to 0 whenever a bot starts from idle/stopped.
 const purchasedQtyMap = new Map<number, number>();
 
 async function addLog(taskId: number, level: string, message: string) {
@@ -30,21 +24,18 @@ async function addLog(taskId: number, level: string, message: string) {
   }
 }
 
-async function runBotCycle(taskId: number, signal: AbortSignal): Promise<void> {
-  const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId));
-  if (!task || task.status !== "running") return;
-
-  const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, task.profileId));
-  if (!profile) {
-    await addLog(taskId, "error", "Profile not found — stopping task");
-    await db.update(tasksTable).set({ status: "failed", updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
-    stopBot(taskId);
-    return;
-  }
-
+async function runBotCycle(
+  taskId: number,
+  signal: AbortSignal,
+  cachedTask: Record<string, unknown>,
+  cachedProfile: Record<string, unknown>
+): Promise<void> {
   await db.update(tasksTable).set({ lastRunAt: new Date(), updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
 
   const log = (level: string, message: string) => addLog(taskId, level, message);
+
+  const task = cachedTask;
+  const profile = cachedProfile;
 
   const botFn = task.site === "dicks"
     ? runDicksBot
@@ -53,67 +44,58 @@ async function runBotCycle(taskId: number, signal: AbortSignal): Promise<void> {
       : runBestBuyBot;
 
   const profileData = {
-    email: profile.email,
-    password: profile.password,
-    firstName: profile.firstName,
-    lastName: profile.lastName,
-    phone: profile.phone,
-    address1: profile.address1,
-    address2: profile.address2,
-    city: profile.city,
-    state: profile.state,
-    zip: profile.zip,
-    cardNumber: profile.cardNumber,
-    cardExpiry: profile.cardExpiry,
-    cardCvv: profile.cardCvv,
-    cardName: profile.cardName,
-    toppsCookies: profile.toppsCookies,
-    bestbuyCookies: profile.bestbuyCookies,
-    proxyUrl: profile.proxyUrl,
+    email: profile.email as string,
+    password: profile.password as string,
+    firstName: profile.firstName as string,
+    lastName: profile.lastName as string,
+    phone: profile.phone as string,
+    address1: profile.address1 as string,
+    address2: profile.address2 as string,
+    city: profile.city as string,
+    state: profile.state as string,
+    zip: profile.zip as string,
+    cardNumber: profile.cardNumber as string,
+    cardExpiry: profile.cardExpiry as string,
+    cardCvv: profile.cardCvv as string,
+    cardName: profile.cardName as string,
+    toppsCookies: profile.toppsCookies as string,
+    bestbuyCookies: profile.bestbuyCookies as string,
+    proxyUrl: profile.proxyUrl as string,
   };
 
-  // How many have we already purchased this session?
   const purchasedSoFar = purchasedQtyMap.get(taskId) ?? 0;
-  const remainingQty = Math.max(1, task.quantity - purchasedSoFar);
+  const remainingQty = Math.max(1, (task.quantity as number) - purchasedSoFar);
 
   const taskData = {
-    id: task.id,
-    keywords: task.keywords,
-    productUrl: task.productUrl,
-    quantity: remainingQty, // only request what we still need
-    maxPrice: task.maxPrice,
+    id: task.id as number,
+    keywords: task.keywords as string,
+    productUrl: task.productUrl as string,
+    quantity: remainingQty,
+    maxPrice: task.maxPrice as number,
   };
 
   const result = await botFn(taskData, profileData, log, signal);
 
-  // ── Best Buy store availability check (every 60s, non-blocking) ────────────
-  // Fires in the background so it never slows down the fast-check loop.
-  // Logs which cities have the item, with an ALL-CAPS DALLAS alert.
+  // Best Buy store availability check (background, non-blocking)
   if (task.site === "bestbuy" && task.productUrl && profile.bestbuyCookies) {
     const now = Date.now();
     const lastCheck = lastStoreCheckMap.get(taskId) ?? 0;
     if (now - lastCheck >= STORE_CHECK_INTERVAL_MS) {
       lastStoreCheckMap.set(taskId, now);
-      checkBestBuyStoreAvailability(task.productUrl, profile.bestbuyCookies, profile.proxyUrl)
+      checkBestBuyStoreAvailability(task.productUrl as string, profile.bestbuyCookies as string, profile.proxyUrl as string)
         .then(({ available, unavailable, dallasHasIt, blocked }) => {
-          if (blocked) {
-            return addLog(taskId, "info", "Store tracker — all metro checks blocked (proxy may need refreshing)");
-          }
+          if (blocked) return addLog(taskId, "info", "Store tracker — all checks blocked");
           if (available.length === 0 && unavailable.length === 0) return;
           const parts: string[] = [];
           if (available.length > 0) parts.push(`IN STOCK: ${available.join(", ")}`);
           if (unavailable.length > 0) parts.push(`no stock: ${unavailable.join(", ")}`);
           const detail = parts.join(" | ");
           if (dallasHasIt) {
-            return addLog(
-              taskId,
-              "success",
-              `🚨 *** DALLAS HAS STOCK! *** — ${detail.toUpperCase()} — PURCHASING NOW!`
-            );
+            return addLog(taskId, "success", `🚨 *** DALLAS HAS STOCK! *** — ${detail.toUpperCase()}`);
           }
-          return addLog(taskId, "info", `Store drop tracker — ${detail}`);
+          return addLog(taskId, "info", `Store tracker — ${detail}`);
         })
-        .catch(() => {/* silently skip if check fails */});
+        .catch(() => {});
     }
   }
 
@@ -121,27 +103,12 @@ async function runBotCycle(taskId: number, signal: AbortSignal): Promise<void> {
     const newTotal = purchasedSoFar + result.qtyPurchased;
     purchasedQtyMap.set(taskId, newTotal);
 
-    if (newTotal >= task.quantity) {
-      // All units acquired — mark the task complete and stop
-      await addLog(
-        taskId,
-        "success",
-        `✅ All ${newTotal} of ${task.quantity} unit${task.quantity !== 1 ? "s" : ""} purchased — task complete!`
-      );
-      await db
-        .update(tasksTable)
-        .set({ status: "success", successAt: new Date(), updatedAt: new Date() })
-        .where(eq(tasksTable.id, taskId));
+    if (newTotal >= (task.quantity as number)) {
+      await addLog(taskId, "success", `✅ All ${newTotal}/${task.quantity} purchased — task complete!`);
+      await db.update(tasksTable).set({ status: "success", successAt: new Date(), updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
       stopBot(taskId);
     } else {
-      // Partial fill — keep hunting the remainder
-      const stillNeed = task.quantity - newTotal;
-      await addLog(
-        taskId,
-        "info",
-        `✔ ${newTotal} of ${task.quantity} purchased — still hunting ${stillNeed} more...`
-      );
-      // Task stays "running" — the loop will call runBotCycle again with reduced qty
+      await addLog(taskId, "info", `✔ ${newTotal}/${task.quantity} purchased — hunting ${(task.quantity as number) - newTotal} more...`);
     }
   }
 }
@@ -149,7 +116,6 @@ async function runBotCycle(taskId: number, signal: AbortSignal): Promise<void> {
 export function startBot(taskId: number): void {
   if (activeBots.has(taskId)) return;
 
-  // Reset purchased count — fresh hunt from 0
   purchasedQtyMap.set(taskId, 0);
 
   const abortController = new AbortController();
@@ -157,49 +123,61 @@ export function startBot(taskId: number): void {
   activeBots.set(taskId, bot);
 
   async function loop() {
-    // ── FAST CHECK LOOP ───────────────────────────────────────────────────────
-    // If a direct product URL is known, hammer it with lightweight HTTP checks
-    // every 750ms. Only launch the full browser/API when we confirm in-stock.
-    // If no URL is configured, fall straight through to the full browser cycle.
+    // Cache task + profile once at startup (re-read every 30s for config changes)
+    let cachedTask: Record<string, unknown> | null = null;
+    let cachedProfile: Record<string, unknown> | null = null;
+    let lastCacheRefresh = 0;
+    const CACHE_REFRESH_MS = 30_000;
 
-    // Track heartbeat logging — confirm the bot is alive every 10s
     let lastHeartbeatMs = 0;
     let checkCount = 0;
     const HEARTBEAT_INTERVAL_MS = 10_000;
 
     while (bot.running && !abortController.signal.aborted) {
       checkCount++;
-      const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).catch(() => [null]);
-      if (!task || task.status !== "running") {
-        bot.running = false;
-        activeBots.delete(taskId);
-        return;
+
+      // Refresh cache periodically
+      const now = Date.now();
+      if (!cachedTask || !cachedProfile || now - lastCacheRefresh > CACHE_REFRESH_MS) {
+        const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).catch(() => [null]);
+        if (!task || task.status !== "running") {
+          bot.running = false;
+          activeBots.delete(taskId);
+          return;
+        }
+        cachedTask = task as unknown as Record<string, unknown>;
+
+        const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, task.profileId)).catch(() => [null]);
+        if (!profile) {
+          await addLog(taskId, "error", "Profile not found — stopping");
+          await db.update(tasksTable).set({ status: "failed", updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
+          stopBot(taskId);
+          return;
+        }
+        cachedProfile = profile as unknown as Record<string, unknown>;
+        lastCacheRefresh = now;
       }
 
+      const task = cachedTask!;
+
       if (task.productUrl) {
-        // ── Fast pre-check ───────────────────────────────────────────────────
-        // Skip the HTTP pre-check for Best Buy when session cookies are present:
-        // the cart API itself is the fastest and most reliable stock signal —
-        // a plain unauthenticated HTTP fetch adds latency without improving accuracy.
-        const [profileForCheck] = await db.select().from(profilesTable).where(eq(profilesTable.id, task.profileId)).catch(() => [null]);
-        const skipFastCheck = task.site === "bestbuy" && !!profileForCheck?.bestbuyCookies;
+        // Fast pre-check: skip for Best Buy with cookies (cart API is the stock signal)
+        const skipFastCheck = task.site === "bestbuy" && !!(cachedProfile as any)?.bestbuyCookies;
 
         let inStock: boolean | null = null;
         if (!skipFastCheck) {
           try {
-            inStock = await fastCheckStock(task.site as Site, task.productUrl);
+            inStock = await fastCheckStock(task.site as Site, task.productUrl as string);
           } catch {
-            inStock = null; // network hiccup — let browser decide
+            inStock = null;
           }
         }
 
         if (inStock === false) {
-          // Confirmed out of stock — skip browser entirely, wait 750ms, retry
-          await db.update(tasksTable).set({ lastRunAt: new Date(), updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
-          const now = Date.now();
-          if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-            await addLog(taskId, "info", `🔍 Still scanning — ${checkCount} checks, no stock found`);
-            lastHeartbeatMs = now;
+          const hbNow = Date.now();
+          if (hbNow - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+            await addLog(taskId, "info", `🔍 Scanning — ${checkCount} checks, no stock`);
+            lastHeartbeatMs = hbNow;
           }
           await new Promise<void>((resolve) => {
             const t = setTimeout(resolve, 750);
@@ -209,14 +187,13 @@ export function startBot(taskId: number): void {
         }
 
         if (inStock === true) {
-          await addLog(taskId, "info", "🟢 In stock detected — launching purchase flow now!");
+          await addLog(taskId, "info", "🟢 IN STOCK — launching purchase!");
         }
-        // inStock === null → can't tell from HTTP, launch browser to be sure
       }
 
-      // ── Full browser / API cycle ──────────────────────────────────────────
+      // Full bot cycle
       try {
-        await runBotCycle(taskId, abortController.signal);
+        await runBotCycle(taskId, abortController.signal, cachedTask!, cachedProfile!);
       } catch (err) {
         logger.error({ err, taskId }, "Unhandled bot cycle error");
         await addLog(taskId, "error", `Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
@@ -224,19 +201,14 @@ export function startBot(taskId: number): void {
 
       if (!bot.running || abortController.signal.aborted) break;
 
-      // Check whether the task succeeded inside runBotCycle (it calls stopBot on success)
       const [refreshed] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).catch(() => [null]);
       if (!refreshed || refreshed.status !== "running") break;
 
-      // Pause before next cycle:
-      //   Topps    → 5s   (Cloudflare + JS-heavy)
-      //   Best Buy → 2s   (cart API is the primary path now — no long Akamai cooldown needed)
-      //   Dick's   → 1.5s (no aggressive bot detection)
-      const pauseMs = refreshed.site === "topps" ? 5000 : refreshed.site === "bestbuy" ? 500 : 1500;
-      // Universal heartbeat — fires after every full cycle regardless of fast-check result
+      // Cycle timing: Topps 3s, Best Buy 500ms, Dick's 1.5s
+      const pauseMs = refreshed.site === "topps" ? 3000 : refreshed.site === "bestbuy" ? 500 : 1500;
       const hbNow = Date.now();
       if (hbNow - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
-        await addLog(taskId, "info", `🔍 Still scanning — ${checkCount} cycles complete, no stock found`);
+        await addLog(taskId, "info", `🔍 Scanning — ${checkCount} cycles, no stock`);
         lastHeartbeatMs = hbNow;
       }
       await new Promise<void>((resolve) => {
@@ -255,13 +227,11 @@ export function startBot(taskId: number): void {
 }
 
 export function runDryRun(taskId: number): void {
-  // Fire a single dry-run cycle in the background (not a loop)
-  // Sets status to "testing" while running, back to "idle" when done.
   db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).then(async ([task]) => {
     if (!task) return;
     const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, task.profileId));
     if (!profile) {
-      await addLog(taskId, "error", "Profile not found — cannot run dry run");
+      await addLog(taskId, "error", "Profile not found");
       await db.update(tasksTable).set({ status: "idle", updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
       return;
     }
@@ -269,7 +239,7 @@ export function runDryRun(taskId: number): void {
     const log = (level: string, message: string) => addLog(taskId, level, message);
     const abortController = new AbortController();
 
-    await addLog(taskId, "info", "Starting dry run — will go through all checkout steps without placing an order...");
+    await addLog(taskId, "info", "Starting dry run...");
 
     const botFn = task.site === "dicks"
       ? runDicksBot
