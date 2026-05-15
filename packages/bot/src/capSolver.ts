@@ -13,62 +13,73 @@ interface TaskResult {
 async function createAndSolve(
   taskPayload: Record<string, unknown>,
   notify?: StatusFn,
-  timeoutMs = 30_000
+  timeoutMs = 60_000,
+  maxRetries = 2
 ): Promise<TaskResult | null> {
   if (!API_KEY) {
     notify?.("CAPSOLVER_API_KEY not set — cannot solve CAPTCHA");
     return null;
   }
 
-  notify?.("Sending CAPTCHA to CapSolver...");
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 1) notify?.(`CAPTCHA solve retry ${attempt}/${maxRetries}...`);
+      else notify?.("Sending CAPTCHA to CapSolver...");
 
-  const createRes = await fetch(`${API_BASE}/createTask`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientKey: API_KEY, task: taskPayload }),
-  });
-  const createData = (await createRes.json()) as Record<string, unknown>;
+      const createRes = await fetch(`${API_BASE}/createTask`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ clientKey: API_KEY, task: taskPayload }),
+      });
+      const createData = (await createRes.json()) as Record<string, unknown>;
 
-  if (createData.errorId && createData.errorId !== 0) {
-    notify?.(`CapSolver error: ${createData.errorDescription ?? createData.errorCode}`);
-    return null;
-  }
+      if (createData.errorId && createData.errorId !== 0) {
+        const errMsg = `${createData.errorDescription ?? createData.errorCode}`;
+        notify?.(`CapSolver error: ${errMsg}`);
+        if (errMsg.includes("balance") || errMsg.includes("KEY")) return null;
+        continue;
+      }
 
-  const taskId = createData.taskId as string;
-  if (!taskId) {
-    notify?.("CapSolver did not return a taskId");
-    return null;
-  }
+      const taskId = createData.taskId as string;
+      if (!taskId) { notify?.("CapSolver did not return a taskId"); continue; }
 
-  notify?.(`CapSolver task ${taskId} — polling for result...`);
-  const deadline = Date.now() + timeoutMs;
+      notify?.(`Task ${taskId} — waiting for solution...`);
+      const deadline = Date.now() + timeoutMs;
 
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 2000));
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1500));
 
-    const resultRes = await fetch(`${API_BASE}/getTaskResult`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ clientKey: API_KEY, taskId }),
-    });
-    const resultData = (await resultRes.json()) as Record<string, unknown>;
+        const resultRes = await fetch(`${API_BASE}/getTaskResult`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ clientKey: API_KEY, taskId }),
+        });
+        const resultData = (await resultRes.json()) as Record<string, unknown>;
 
-    if (resultData.status === "ready") {
-      const solution = resultData.solution as Record<string, unknown>;
-      notify?.("CAPTCHA solved!");
-      return {
-        token: solution.token as string,
-        userAgent: solution.userAgent as string | undefined,
-      };
+        if (resultData.status === "ready") {
+          const solution = resultData.solution as Record<string, unknown>;
+          notify?.("CAPTCHA solved!");
+          return {
+            token: solution.token as string,
+            userAgent: solution.userAgent as string | undefined,
+          };
+        }
+
+        if (resultData.status === "failed" || (resultData.errorId && resultData.errorId !== 0)) {
+          notify?.(`Solve failed: ${resultData.errorDescription ?? resultData.errorCode ?? "unknown"}`);
+          break;
+        }
+      }
+
+      if (Date.now() >= deadline) {
+        notify?.(`Attempt ${attempt} timed out (${timeoutMs / 1000}s)`);
+      }
+    } catch (err) {
+      notify?.(`CapSolver network error: ${err instanceof Error ? err.message : String(err)}`);
     }
-
-    if (resultData.status === "failed" || (resultData.errorId && resultData.errorId !== 0)) {
-      notify?.(`CapSolver solve failed: ${resultData.errorDescription ?? resultData.errorCode ?? "unknown"}`);
-      return null;
-    }
   }
 
-  notify?.("CapSolver timed out waiting for solution");
+  notify?.("All CAPTCHA solve attempts exhausted");
   return null;
 }
 

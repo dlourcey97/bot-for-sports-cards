@@ -133,42 +133,94 @@ interface ProductScanResult {
   debugError?: string;
 }
 
-async function scanToppsApi(
-  keywords: string,
-  proxyUrl?: string | null
-): Promise<ProductScanResult> {
+function parseKeywords(keywords: string) {
   const parts = keywords.split(",").map((k) => k.trim());
   const positive = parts.filter((k) => k.startsWith("+")).map((k) => k.slice(1).trim().toLowerCase());
   const negative = parts.filter((k) => k.startsWith("-")).map((k) => k.slice(1).trim().toLowerCase());
   const searchQuery = (positive.length > 0 ? positive : parts).slice(0, 5).join(" ");
+  return { positive, negative, searchQuery };
+}
+
+type Variant = { id: number; title: string; available: boolean; price: string };
+
+function matchProduct(
+  products: Array<{ title: string; handle: string; variants: Variant[] }>,
+  positive: string[],
+  negative: string[]
+): ProductScanResult {
+  for (const product of products) {
+    const title = product.title.toLowerCase();
+    if (positive.length > 0 && !positive.every((k) => title.includes(k))) continue;
+    if (negative.some((k) => title.includes(k))) continue;
+    if (!product.variants.some((v) => v.available)) continue;
+
+    const variant = product.variants.find((v) => v.title.toLowerCase().includes("hobby") && v.available)
+      ?? product.variants.find((v) => v.available)
+      ?? product.variants[0];
+
+    return {
+      variantId: variant ? String(variant.id) : null,
+      handle: product.handle,
+      price: variant ? parseFloat(variant.price) / 100 : null,
+      productUrl: `https://www.topps.com/products/${product.handle}`,
+      apiReachable: true,
+    };
+  }
+  return { variantId: null, handle: null, price: null, productUrl: null, apiReachable: true };
+}
+
+// Keep-alive HTTP agent — reuses TCP+TLS connections across requests
+let _keepAliveAgent: InstanceType<typeof import("undici").Agent> | null = null;
+async function getKeepAliveAgent() {
+  if (!_keepAliveAgent) {
+    const { Agent } = await import("undici");
+    _keepAliveAgent = new Agent({ keepAliveTimeout: 30_000, keepAliveMaxTimeout: 60_000, connections: 4 });
+  }
+  return _keepAliveAgent;
+}
+
+async function scanToppsApi(
+  keywords: string,
+  proxyUrl?: string | null,
+  cookiesJson?: string | null,
+): Promise<ProductScanResult> {
+  const { positive, negative, searchQuery } = parseKeywords(keywords);
   const encoded = encodeURIComponent(searchQuery);
+  const url = `https://www.topps.com/products.json?q=${encoded}&limit=100`;
+
+  // Build cookie header from saved session cookies to bypass Cloudflare
+  let cookieHeader = "";
+  if (cookiesJson) {
+    try {
+      const cookies = JSON.parse(cookiesJson);
+      if (Array.isArray(cookies)) {
+        cookieHeader = cookies.map((c: any) => `${c.name}=${c.value}`).join("; ");
+      }
+    } catch {}
+  }
+
+  const headers: Record<string, string> = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html,application/xhtml+xml",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.topps.com/",
+    "Origin": "https://www.topps.com",
+  };
+  if (cookieHeader) headers["Cookie"] = cookieHeader;
 
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), 8000);
 
   try {
-    let response: Response;
-    if (proxyUrl) {
-      const { fetch: undiciFetch, ProxyAgent } = await import("undici");
-      const dispatcher = new ProxyAgent(proxyUrl);
-      response = await (undiciFetch as unknown as (url: string, init?: Record<string, unknown>) => Promise<Response>)(
-        `https://www.topps.com/products.json?q=${encoded}&limit=100`,
-        {
-          dispatcher,
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-          },
-          signal: ac.signal,
-        }
-      );
-    } else {
-      response = await fetch(
-        `https://www.topps.com/products.json?q=${encoded}&limit=100`,
-        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }, signal: ac.signal }
-      );
-    }
+    const { fetch: undiciFetch, ProxyAgent } = await import("undici");
+    const agent = proxyUrl ? new ProxyAgent(proxyUrl) : await getKeepAliveAgent();
+
+    const response = await (undiciFetch as any)(url, {
+      dispatcher: agent,
+      headers,
+      signal: ac.signal,
+    });
     clearTimeout(timer);
 
     if (!response.ok) return { variantId: null, handle: null, price: null, productUrl: null, apiReachable: false, debugStatus: response.status };
@@ -176,29 +228,10 @@ async function scanToppsApi(
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("json")) return { variantId: null, handle: null, price: null, productUrl: null, apiReachable: false, debugError: `non-JSON (${contentType})` };
 
-    type Variant = { id: number; title: string; available: boolean; price: string };
     const data = await response.json() as { products?: Array<{ title: string; handle: string; variants: Variant[] }> };
     if (!data.products) return { variantId: null, handle: null, price: null, productUrl: null, apiReachable: false };
 
-    for (const product of data.products) {
-      const title = product.title.toLowerCase();
-      if (positive.length > 0 && !positive.every((k) => title.includes(k))) continue;
-      if (negative.some((k) => title.includes(k))) continue;
-      if (!product.variants.some((v) => v.available)) continue;
-
-      const variant = product.variants.find((v) => v.title.toLowerCase().includes("hobby") && v.available)
-        ?? product.variants.find((v) => v.available)
-        ?? product.variants[0];
-
-      return {
-        variantId: variant ? String(variant.id) : null,
-        handle: product.handle,
-        price: variant ? parseFloat(variant.price) / 100 : null,
-        productUrl: `https://www.topps.com/products/${product.handle}`,
-        apiReachable: true,
-      };
-    }
-    return { variantId: null, handle: null, price: null, productUrl: null, apiReachable: true };
+    return matchProduct(data.products, positive, negative);
   } catch (err) {
     clearTimeout(timer);
     const msg = err instanceof Error ? err.message : String(err);
@@ -544,7 +577,7 @@ async function runToppsBotImpl(
   try {
     // ── STEP 1: API scan — get variant ID + product URL (no browser) ─────
     await log("info", `🔎 Scanning Topps API for: "${task.keywords}"`);
-    const scan = await scanToppsApi(task.keywords, profile.proxyUrl);
+    const scan = await scanToppsApi(task.keywords, profile.proxyUrl, profile.toppsCookies);
 
     if (!scan.variantId) {
       if (scan.apiReachable) return false; // not in stock yet

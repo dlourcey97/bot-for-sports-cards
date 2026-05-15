@@ -34,8 +34,14 @@ profile:
   bestbuyCookies: ""             # paste JSON array string here
   toppsCookies: ""               # paste JSON array string here
 
-  # Proxy (optional — residential proxy helps avoid IP blocks)
-  proxyUrl: ""                   # e.g. "http://user:pass@proxy.decodo.com:7777"
+  # Proxy (RECOMMENDED — residential proxy avoids Cloudflare/Akamai blocks)
+  # Without a proxy, Cloudflare will block API scans from server IPs.
+  # Recommended providers (all legal, residential rotating proxies):
+  #   - Bright Data: https://brightdata.com (~$10/mo for 1GB)
+  #   - Decodo: https://decodo.com (~$8/mo)
+  #   - IPRoyal: https://iproyal.com (~$7/mo)
+  # Format: "http://username:password@proxy-host:port"
+  proxyUrl: ""                   # e.g. "http://user:pass@gate.decodo.com:7777"
 
 # Tasks — add as many as you want
 tasks:
