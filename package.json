@@ -1,0 +1,16 @@
+{
+  "name": "card-bot",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "lint": "tsc --noEmit --project packages/bot/tsconfig.json && tsc --noEmit --project packages/db/tsconfig.json",
+    "dev": "npm run dev --workspace=packages/bot",
+    "test": "node --test packages/bot/src/__tests__/*.test.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
