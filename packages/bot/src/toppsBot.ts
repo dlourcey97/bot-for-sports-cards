@@ -2,6 +2,7 @@
 import type { Page, Browser, BrowserContext } from "playwright";
 import { launchStealthBrowser, createStealthContext, humanDelay, getWarmSession, closeWarmSession } from "./stealthBrowser";
 import { handleAnyCaptcha, solveTurnstile } from "./capSolver";
+import { shopifyFastCheckout } from "./shopifyFastCheckout";
 import type { BotProfile, BotTask, LogFn } from "./dicksBot";
 
 // ── SPEED CONFIG ─────────────────────────────────────────────────────────────
@@ -601,7 +602,29 @@ async function runToppsBotImpl(
 
     if (signal.aborted) return false;
 
-    // ── STEP 3: Get warm browser on topps.com ────────────────────────────
+    // ── STEP 3: Try FAST CHECKOUT first (pure HTTP, ~2 seconds) ──────────
+    if (profile.toppsCookies) {
+      await log("info", "⚡ Attempting fast checkout (no browser)...");
+      const t0 = Date.now();
+      try {
+        const fastResult = await shopifyFastCheckout(scan.variantId, task, profile, log);
+        const elapsed = Date.now() - t0;
+
+        if (fastResult.success) {
+          await log("success", `⚡ Fast checkout completed in ${elapsed}ms!`);
+          return true;
+        }
+
+        await log("warn", `⚡ Fast checkout failed (${elapsed}ms): ${fastResult.error} — falling back to browser`);
+      } catch (err) {
+        const elapsed = Date.now() - t0;
+        await log("warn", `⚡ Fast checkout error (${elapsed}ms): ${err instanceof Error ? err.message : String(err)} — falling back to browser`);
+      }
+    }
+
+    if (signal.aborted) return false;
+
+    // ── STEP 4: Browser fallback (if fast checkout failed) ───────────────
     const warm = await getWarmSession("topps.com", profile.toppsCookies, profile.proxyUrl, ".topps.com");
     browser = warm.browser;
     const page = warm.page;
