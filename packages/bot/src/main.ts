@@ -210,6 +210,23 @@ async function main() {
       break;
     }
 
+    case "import-cookies": {
+      const site = args[1] ?? "topps";
+      const cookieArg = args[2] ?? "";
+      const { execSync } = await import("node:child_process");
+      if (cookieArg) {
+        execSync(`npx tsx packages/bot/src/importCookies.ts ${site} '${cookieArg.replace(/'/g, "'\\''")}'`, {
+          cwd: process.cwd(), stdio: "inherit", env: { ...process.env }, timeout: 15_000,
+        });
+      } else {
+        logger.info("Paste your cookies JSON (from Cookie-Editor export), then press Ctrl+D:");
+        execSync(`npx tsx packages/bot/src/importCookies.ts ${site}`, {
+          cwd: process.cwd(), stdio: "inherit", env: { ...process.env }, timeout: 120_000,
+        });
+      }
+      break;
+    }
+
     case "warmup": {
       const warmupArg = args[1] ?? "all";
       const extraArg = args[2] ?? "";
@@ -297,18 +314,21 @@ async function main() {
       console.log("Card Bot CLI");
       console.log("");
       console.log("Commands:");
-      console.log("  load-config <file>    Load profile + tasks from a YAML config file");
-      console.log("  warmup [site]         Refresh cookies by logging in (bestbuy|topps|all)");
-      console.log("  warmup lock [site]    Lock a clean proxy session before a drop (keeps browser warm)");
-      console.log("  status                Show all profiles and tasks");
-      console.log("  dry-run <taskId>      Test checkout flow without placing an order");
-      console.log("  start <taskId>        Start sniping (live mode)");
-      console.log("  logs [taskId]         View bot logs");
+      console.log("  load-config <file>       Load profile + tasks from a YAML config file");
+      console.log("  import-cookies [site]    Import cookies from your real browser (bypasses CF)");
+      console.log("  warmup [site]            Refresh cookies by logging in (bestbuy|topps|all)");
+      console.log("  warmup lock [site]       Lock a clean proxy session (keeps browser warm)");
+      console.log("  status                   Show all profiles and tasks");
+      console.log("  dry-run <taskId>         Test checkout flow without placing an order");
+      console.log("  start <taskId>           Start sniping (live mode)");
+      console.log("  logs [taskId]            View bot logs");
       console.log("");
-      console.log("Drop day workflow:");
-      console.log("  1. export CAPSOLVER_API_KEY=\"CAP-...\"");
-      console.log("  2. npx tsx packages/bot/src/main.ts warmup lock topps   # lock clean proxy IP");
-      console.log("  3. (in another terminal) npx tsx packages/bot/src/main.ts start 2");
+      console.log("Drop day workflow (10/10):");
+      console.log("  1. Open topps.com in Chrome (pass CF as human)");
+      console.log("  2. Export cookies with Cookie-Editor extension");
+      console.log("  3. npx tsx packages/bot/src/main.ts import-cookies topps < cookies.json");
+      console.log("  4. export CAPSOLVER_API_KEY=\"CAP-...\"");
+      console.log("  5. npx tsx packages/bot/src/main.ts start 2");
   }
 }
 
