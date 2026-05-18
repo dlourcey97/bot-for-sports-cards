@@ -25,7 +25,7 @@ tasks:
     maxPrice: null
 
   - site: "topps"
-    keywords: "+hobby, +box"
+    keywords: "+inception, +baseball, +hobby"
     productUrl: ""
-    quantity: 1
+    quantity: 3
     maxPrice: null

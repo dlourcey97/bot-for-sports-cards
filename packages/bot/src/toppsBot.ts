@@ -48,29 +48,47 @@ async function handleCloudflareThenGoTo(
   proxyUrl?: string
 ): Promise<boolean> {
   if (!(await isCloudflareBlock(page))) return true;
-  await log("warn", `⚠️ Cloudflare challenge detected — solving...`);
+  await log("warn", `⚠️ Cloudflare challenge detected — waiting for auto-resolve...`);
   try {
+    // CF "Just a moment..." JS challenge auto-resolves in 5-10 seconds
+    // Wait up to 15 seconds for it to clear on its own
+    for (let i = 0; i < 6; i++) {
+      await new Promise(r => setTimeout(r, 2500));
+      if (!(await isCloudflareBlock(page))) {
+        await log("info", "Cloudflare cleared!");
+        return true;
+      }
+    }
+
+    // Still blocked — try Turnstile solver
     const solved = await solveTurnstile(page, proxyUrl);
     if (solved) {
-      await log("info", "Cloudflare solved — continuing...");
-      await FAST_DELAY(500, 1000);
+      await log("info", "Cloudflare solved via CapSolver");
+      await FAST_DELAY(1000, 2000);
       if (page.url() !== returnUrl) {
         await page.goto(returnUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
-        await FAST_DELAY(500, 1000);
+        await FAST_DELAY(1000, 2000);
       }
       return !(await isCloudflareBlock(page));
     }
 
-    // Fallback: click the challenge button directly
+    // Fallback: click the challenge button
     const cfBtn = page.locator(
       'button:has-text("Click to reveal"), button:has-text("Verify you are human"), ' +
-      'button:has-text("I am not a robot"), input[type="submit"]'
+      'button:has-text("I am not a robot"), input[type="submit"], .cf-turnstile'
     ).first();
     if (await cfBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
       await cfBtn.click();
       await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
-      await FAST_DELAY(1000, 2000);
+      await new Promise(r => setTimeout(r, 5000));
       if (!(await isCloudflareBlock(page))) return true;
+    }
+
+    // Final wait — sometimes CF just needs more time
+    await new Promise(r => setTimeout(r, 5000));
+    if (!(await isCloudflareBlock(page))) {
+      await log("info", "Cloudflare cleared after extended wait");
+      return true;
     }
 
     await log("warn", "⛔ Cloudflare block persists — will retry next cycle");
@@ -583,13 +601,9 @@ async function runToppsBotImpl(
     if (!scan.variantId) {
       if (scan.apiReachable) return false; // not in stock yet
 
-      // API blocked — fall back to browser if we have a product URL
-      if (task.productUrl && task.productUrl.includes("/products/")) {
-        await log("warn", `API blocked (${scan.debugError ?? scan.debugStatus}) — falling back to browser`);
-        return runToppsBotBrowserFallback(task, profile, log, signal);
-      }
-      await log("warn", `API unreachable (${scan.debugError ?? scan.debugStatus}) — retrying next cycle`);
-      return false;
+      // API blocked by Cloudflare — fall back to browser scan
+      await log("warn", `API blocked (${scan.debugError ?? scan.debugStatus}) — using browser to scan`);
+      return runToppsBotBrowserFallback(task, profile, log, signal);
     }
 
     // ── STEP 2: Price check ──────────────────────────────────────────────
@@ -716,15 +730,19 @@ async function runToppsBotBrowserFallback(
     browser = warm.browser;
     const page = warm.page;
 
-    await page.goto(task.productUrl!, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
+    const targetUrl = task.productUrl && task.productUrl.includes("/products/")
+      ? task.productUrl
+      : "https://www.topps.com";
+
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 20000 }).catch(() => {});
     await FAST_DELAY(1000, 2000);
 
     if (await isCloudflareBlock(page)) {
-      const cleared = await handleCloudflareThenGoTo(page, task.productUrl!, log, profile.proxyUrl);
+      const cleared = await handleCloudflareThenGoTo(page, targetUrl, log, profile.proxyUrl);
       if (!cleared) { await closeWarmSession("topps.com", profile.proxyUrl); return false; }
     }
 
-    await loginIfNeeded(page, profile.email, profile.password, task.productUrl!, log);
+    await loginIfNeeded(page, profile.email, profile.password, targetUrl, log);
 
     if (await isInQueue(page)) {
       const passed = await waitThroughQueue(page, log, signal);
@@ -741,8 +759,9 @@ async function runToppsBotBrowserFallback(
 
     if (signal.aborted) return false;
 
-    // Get variant via in-browser API (same origin bypasses CF)
-    const variantId = await page.evaluate(async () => {
+    // Get variant via in-browser scan (same origin bypasses CF)
+    const { positive, negative } = parseKeywords(task.keywords);
+    const variantId = await page.evaluate(async ({ positive, negative }) => {
       const anchors = Array.from(document.querySelectorAll("a[href*='/products/']"));
       const handles = new Set<string>();
       const m0 = window.location.pathname.match(/\/products\/([^/?#]+)/);
@@ -755,15 +774,20 @@ async function runToppsBotBrowserFallback(
         try {
           const res = await fetch(`/products/${handle}.json`);
           if (!res.ok) continue;
-          const data = await res.json() as { product?: { variants?: Array<{ id: number; title: string; available: boolean }> } };
+          const data = await res.json() as { product?: { title?: string; variants?: Array<{ id: number; title: string; available: boolean }> } };
           const v = data.product?.variants;
+          const title = (data.product?.title ?? "").toLowerCase();
           if (!v?.length) continue;
+          // Check keyword match
+          if (positive.length > 0 && !positive.every((k: string) => title.includes(k) || handle.includes(k))) continue;
+          if (negative.some((k: string) => title.includes(k))) continue;
+          if (!v.some(x => x.available)) continue;
           const pick = v.find(x => x.title.toLowerCase().includes("hobby") && x.available) ?? v.find(x => x.available);
           if (pick) return String(pick.id);
         } catch {}
       }
       return null;
-    }).catch(() => null);
+    }, { positive, negative }).catch(() => null);
 
     if (!variantId) {
       await log("warn", "No variant found via browser — not available yet");
