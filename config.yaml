@@ -1,0 +1,25 @@
+profile:
+  email: "dean.lourcey@gmail.com"
+  password: "Dazzle97!dean"
+  firstName: "Dean"
+  lastName: "Lourcey"
+  phone: "214-717-2303"
+  address1: "2808 McKinney Ave APT 740"
+  address2: ""
+  city: "Dallas"
+  state: "TX"
+  zip: "75204"
+  cardNumber: "5524860356527914"
+  cardExpiry: "08/27"
+  cardCvv: "545"
+  cardName: "Dean Lourcey"
+  bestbuyCookies: ""
+  toppsCookies: ""
+  proxyUrl: "http://spz8m6fyhn:~4pxjFmfRlsM4n4X4g@isp.decodo.com:10001"
+
+tasks:
+  - site: "topps"
+    keywords: "+chrome, +cactus, +jack, +hobby"
+    productUrl: ""
+    quantity: 2
+    maxPrice: null

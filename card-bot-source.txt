@@ -1,0 +1,2225 @@
+// ============================================================
+// CARD BOT — FULL SOURCE
+// Generated: $(date)
+// Files: bestbuyBot.ts | toppsBot.ts | botRunner.ts
+// ============================================================
+
+// ============================================================
+// FILE: bestbuyBot.ts
+// ============================================================
+import type { Page, Browser } from "playwright";
+import { launchStealthBrowser, createStealthContext, humanDelay } from "./stealthBrowser";
+import { handleAnyCaptcha } from "./capSolver";
+import type { BotProfile, BotTask, LogFn, BotResult } from "./dicksBot";
+
+async function dismissPopups(page: Page) {
+  try {
+    const selectors = [
+      '[aria-label="Close"]',
+      'button:has-text("No Thanks")',
+      'button:has-text("Close")',
+      '.c-close-icon',
+      '[data-track*="close"]',
+      'button:has-text("Not Now")',
+    ];
+    for (const sel of selectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await btn.click();
+        await humanDelay(300, 600);
+        break;
+      }
+    }
+  } catch {}
+}
+
+/** Extract SKU ID from a Best Buy product URL */
+function extractSkuId(url: string): string | null {
+  const fromQuery = url.match(/[?&]skuId=(\d+)/);
+  if (fromQuery) return fromQuery[1];
+  const fromPath = url.match(/\/(\d{7,})\b/);
+  if (fromPath) return fromPath[1];
+  return null;
+}
+
+interface CartApiResult {
+  result: "added" | "out_of_stock" | "error" | "not_online_sellable";
+  /** How many units were actually added to cart (0 on non-added) */
+  qtyAdded: number;
+}
+
+/** Build Best Buy cart API request headers from a cookie JSON string */
+function bbCartHeaders(cookieHeader: string) {
+  return {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+    "Origin": "https://www.bestbuy.com",
+    "Referer": "https://www.bestbuy.com/site/searchpage.jsp?st=trading+cards",
+    "Cookie": cookieHeader,
+  };
+}
+
+/**
+ * Try to add `qty` units of `skuId` to cart.  Returns the number actually added,
+ * or 0 if unavailable, or -1 on hard error.
+ */
+async function tryAddQty(skuId: string, cookieHeader: string, qty: number): Promise<{ added: boolean; body: string; status: number }> {
+  try {
+    const res = await fetch("https://www.bestbuy.com/cart/api/v1/addToCart", {
+      method: "POST",
+      headers: bbCartHeaders(cookieHeader),
+      body: JSON.stringify({ items: [{ skuId, quantity: qty, offerId: null, location: null }] }),
+    });
+    const body = await res.text().catch(() => "");
+    return { added: res.ok, body, status: res.status };
+  } catch {
+    return { added: false, body: "", status: 0 };
+  }
+}
+
+/**
+ * Add a Best Buy item to cart using Node.js native fetch (bypasses Akamai TLS fingerprinting).
+ * On QUANTITY_EXCEEDED, steps down: requested → half → 1 to buy as many as possible.
+ * Returns the result and how many units were actually added.
+ */
+async function addToCartViaApi(
+  skuId: string,
+  cookiesJson: string,
+  quantity: number,
+  log: LogFn
+): Promise<CartApiResult> {
+  try {
+    const cookieArr: Array<{ name: string; value: string }> = JSON.parse(cookiesJson);
+    const cookieHeader = cookieArr.map((c) => `${c.name}=${c.value}`).join("; ");
+
+    // First attempt — try the full requested quantity
+    const first = await tryAddQty(skuId, cookieHeader, quantity);
+
+    if (first.added) {
+      // Parse actual qty from response when available; fall back to requested
+      let qtyAdded = quantity;
+      try {
+        const parsed = JSON.parse(first.body);
+        const lineQty = parsed?.lineItems?.[0]?.quantity ?? parsed?.items?.[0]?.quantity;
+        if (typeof lineQty === "number" && lineQty > 0) qtyAdded = lineQty;
+      } catch {}
+      await log("success", `Cart API: ${qtyAdded} × SKU ${skuId} added to cart`);
+      return { result: "added", qtyAdded };
+    }
+
+    const body = first.body;
+    const snippet = body.slice(0, 200).replace(/\s+/g, " ");
+
+    // Auth failure — expired or missing session cookies
+    if (
+      first.status === 401 || first.status === 403 ||
+      body.includes("Unauthorized") || body.includes("unauthorized") ||
+      body.includes("\"authenticated\":false") || body.includes("not logged in") ||
+      body.includes("SESSION_EXPIRED") || body.includes("INVALID_SESSION")
+    ) {
+      await log("warn", `⚠️ Best Buy session expired (HTTP ${first.status}) — refresh your cookies in the Profile. Response: ${snippet}`);
+      return { result: "error", qtyAdded: 0 };
+    }
+
+    // API-blocked item — Best Buy won't sell this via the cart API (requires browser product page)
+    if (body.includes("ITEM_NOT_SELLABLE")) {
+      return { result: "not_online_sellable", qtyAdded: 0 };
+    }
+
+    // Genuinely out of stock / not available
+    if (body.includes("NOT_AVAILABLE") || body.includes("unavailable")) {
+      await log("info", `Cart API: SKU ${skuId} out of stock (HTTP ${first.status}) — ${snippet}`);
+      return { result: "out_of_stock", qtyAdded: 0 };
+    }
+
+    // Regional/account constraint (CONSTRAINED_ITEM or DHV variant) — silently treat as out of stock
+    if (body.includes("CONSTRAINED_ITEM") || body.includes("DHV")) {
+      await log("warn", `Cart API: SKU ${skuId} constrained/restricted for this account (HTTP ${first.status})`);
+      return { result: "out_of_stock", qtyAdded: 0 };
+    }
+
+    // Quantity exceeded — step down progressively: requested → half → 1
+    if (body.includes("QUANTITY_EXCEEDED") || body.includes("BBYD_QUANTITY")) {
+      const steps = [...new Set([Math.max(1, Math.floor(quantity / 2)), 1])];
+      for (const step of steps) {
+        await log("warn", `Quantity limit hit (requested ${quantity}) — retrying with ${step}...`);
+        const retry = await tryAddQty(skuId, cookieHeader, step);
+        if (retry.added) {
+          let qtyAdded = step;
+          try {
+            const parsed = JSON.parse(retry.body);
+            const lineQty = parsed?.lineItems?.[0]?.quantity ?? parsed?.items?.[0]?.quantity;
+            if (typeof lineQty === "number" && lineQty > 0) qtyAdded = lineQty;
+          } catch {}
+          await log("success", `Cart API: ${qtyAdded} × SKU ${skuId} added to cart (partial — site limit)`);
+          return { result: "added", qtyAdded };
+        }
+        if (
+          retry.body.includes("NOT_SELLABLE") ||
+          retry.body.includes("NOT_AVAILABLE") ||
+          retry.body.includes("unavailable")
+        ) {
+          return { result: "out_of_stock", qtyAdded: 0 };
+        }
+      }
+      await log("warn", `All quantity steps rejected — out of stock or account locked`);
+      return { result: "out_of_stock", qtyAdded: 0 };
+    }
+
+    // Unexpected response — log full status + body so we can diagnose
+    await log("warn", `Cart API unexpected response HTTP ${first.status} for SKU ${skuId} — ${snippet}`);
+    return { result: "error", qtyAdded: 0 };
+  } catch (err) {
+    await log("warn", `Cart API error: ${err instanceof Error ? err.message : String(err)}`);
+    return { result: "error", qtyAdded: 0 };
+  }
+}
+
+/**
+ * Fast authenticated HTTP check — fetch the product page with session cookies and look for
+ * the Add to Cart button state. Returns true if the page shows the item as purchasable.
+ * Much faster than launching a browser (~300ms vs 15s).
+ */
+async function checkPageForAtc(productUrl: string, cookiesJson: string): Promise<boolean> {
+  try {
+    const cookies: Array<{ name: string; value: string }> = JSON.parse(cookiesJson);
+    const cookieHeader = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    const res = await fetch(productUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cookie": cookieHeader,
+      },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    clearTimeout(timer);
+    if (!res.ok) return false;
+    const html = await res.text();
+    if (html.includes('"buttonState":"SOLD_OUT"') || html.includes("Sold Out")) return false;
+    return (
+      html.includes('"buttonState":"ADD_TO_CART"') ||
+      html.includes('"ADD_TO_CART"') ||
+      (html.includes("Add to Cart") && !html.includes("Sold Out"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fast browser-based Add-to-Cart + checkout.
+ * Skips homepage warmup and search navigation — goes directly to the product URL
+ * with cookies pre-injected. Used when the cart API returns ITEM_NOT_SELLABLE but the
+ * product page shows an active Add to Cart button.
+ */
+async function fastBrowserAtcAndCheckout(
+  task: BotTask,
+  profile: BotProfile,
+  log: LogFn,
+  signal: AbortSignal
+): Promise<BotResult> {
+  let browser: Browser | null = null;
+  try {
+    browser = await launchStealthBrowser();
+    const context = await createStealthContext(browser, profile.proxyUrl);
+
+    // Inject session cookies
+    try {
+      const rawCookies: Array<Record<string, unknown>> = JSON.parse(profile.bestbuyCookies ?? "[]");
+      const normalizeSameSite = (v: unknown): "Strict" | "Lax" | "None" => {
+        if (!v || v === "null") return "Lax";
+        const s = String(v).toLowerCase();
+        if (s === "strict") return "Strict";
+        if (s === "none" || s === "no_restriction") return "None";
+        return "Lax";
+      };
+      await context.addCookies(
+        rawCookies.map((c) => ({
+          name: String(c.name),
+          value: String(c.value),
+          domain: String(c.domain ?? ".bestbuy.com"),
+          path: String(c.path ?? "/"),
+          secure: Boolean(c.secure ?? false),
+          httpOnly: Boolean(c.httpOnly ?? false),
+          sameSite: normalizeSameSite(c.sameSite),
+        }))
+      );
+      await log("info", `Injected ${rawCookies.length} cookies — navigating directly to product page`);
+    } catch (e) {
+      await log("warn", `Cookie injection failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    const page = await context.newPage();
+    if (signal.aborted) { await browser.close().catch(() => {}); return { success: false, qtyPurchased: 0 }; }
+
+    // Go straight to the product page — no homepage warmup needed since cookies handle auth
+    await page.goto(task.productUrl!, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await humanDelay(1000, 2000);
+    await dismissPopups(page);
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+
+    // Verify ATC button is still live (stock may have sold out while browser was launching)
+    const addToCartBtn = page.locator(
+      'button.add-to-cart-button, button[data-button-state="ADD_TO_CART"], button:has-text("Add to Cart")'
+    ).first();
+    const isAvailable = await addToCartBtn.isVisible({ timeout: 6000 }).catch(() => false);
+    if (!isAvailable) {
+      await log("warn", "Add to Cart button gone by the time browser loaded — sold out");
+      await browser.close().catch(() => {});
+      return { success: false, qtyPurchased: 0 };
+    }
+
+    await log("success", "🟢 ADD TO CART button live — clicking now!");
+    await addToCartBtn.click();
+    await humanDelay(2000, 3500);
+    await dismissPopups(page);
+
+    if (signal.aborted) { await browser.close().catch(() => {}); return { success: false, qtyPurchased: 0 }; }
+
+    // Go to cart
+    const goToCartBtn = page.locator('a:has-text("Go to Cart"), button:has-text("Go to Cart")').first();
+    if (await goToCartBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await goToCartBtn.click();
+      await humanDelay(1500, 2500);
+    } else {
+      await page.goto("https://www.bestbuy.com/cart", { waitUntil: "domcontentloaded", timeout: 30000 });
+      await humanDelay(1500, 2500);
+    }
+
+    // Checkout
+    const checkoutBtn = page.locator('button:has-text("Checkout"), a:has-text("Checkout")').first();
+    if (await checkoutBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
+      await checkoutBtn.click();
+      await page.waitForLoadState("domcontentloaded", { timeout: 30000 });
+      await humanDelay(2000, 3500);
+    }
+
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+    if (signal.aborted) { await browser.close().catch(() => {}); return { success: false, qtyPurchased: 0 }; }
+
+    // Sign in if prompted (cookies should keep us logged in, but just in case)
+    const emailInput = page.locator('input[name="fld-e"], input[type="email"], input[id*="email"]').first();
+    if (await emailInput.isVisible({ timeout: 4000 }).catch(() => false)) {
+      await log("info", "Sign-in prompt — entering credentials...");
+      await emailInput.fill(profile.email);
+      await humanDelay(300, 600);
+      const continueBtn = page.locator('button:has-text("Continue"), button[type="submit"]').first();
+      await continueBtn.click();
+      await humanDelay(1500, 2500);
+      const passInput = page.locator('input[type="password"]').first();
+      if (await passInput.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await passInput.fill(profile.password);
+        await humanDelay(300, 600);
+        const signinBtn = page.locator('button:has-text("Sign In"), button[type="submit"]').first();
+        await signinBtn.click();
+        await humanDelay(3000, 5000);
+        await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+      }
+    } else {
+      await log("info", "Session active — already signed in");
+    }
+
+    if (signal.aborted) { await browser.close().catch(() => {}); return { success: false, qtyPurchased: 0 }; }
+
+    // Shipping
+    await humanDelay(1500, 2500);
+    const continueShipping = page.locator('button:has-text("Continue"), button:has-text("Next step"), button:has-text("Save & Continue")').first();
+    if (await continueShipping.isVisible({ timeout: 6000 }).catch(() => false)) {
+      await continueShipping.click();
+      await humanDelay(1500, 2500);
+    }
+
+    // Payment
+    await log("info", `Entering payment: **** **** **** ${profile.cardNumber.slice(-4)}`);
+    await humanDelay(500, 1000);
+    const cardInput = page.locator('input[id*="credit-card-number"], input[name*="number"], input[autocomplete="cc-number"]').first();
+    if (await cardInput.isVisible({ timeout: 6000 }).catch(() => false)) {
+      await cardInput.fill(profile.cardNumber.replace(/\s/g, ""));
+      await humanDelay(200, 400);
+      const expInput = page.locator('input[id*="expiration"], input[autocomplete="cc-exp"]').first();
+      await expInput.fill(profile.cardExpiry.replace("/", ""));
+      await humanDelay(200, 400);
+      const cvvInput = page.locator('input[id*="cvv"], input[id*="cvc"], input[autocomplete="cc-csc"]').first();
+      await cvvInput.fill(profile.cardCvv);
+      await humanDelay(200, 400);
+    }
+    const continuePayment = page.locator('button:has-text("Continue"), button:has-text("Review Order"), button:has-text("Save & Continue")').first();
+    if (await continuePayment.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await continuePayment.click();
+      await humanDelay(1500, 2500);
+    }
+
+    if (signal.aborted) { await browser.close().catch(() => {}); return { success: false, qtyPurchased: 0 }; }
+
+    // Place order
+    await log("info", "Reviewing and placing order...");
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+    const placeOrderBtn = page.locator([
+      'button:has-text("Place Your Order")',
+      'button:has-text("Place Order")',
+      'button:has-text("Submit Order")',
+      'button[data-track*="place-order"]',
+      'button[class*="place-order"]',
+      'button[data-test*="place-order"]',
+    ].join(", ")).first();
+
+    if (await placeOrderBtn.isVisible({ timeout: 12000 }).catch(() => false)) {
+      if ((task as BotTask & { dryRun?: boolean }).dryRun) {
+        await log("success", "✓ DRY RUN COMPLETE — Place Order button found. No order placed.");
+        await browser.close().catch(() => {});
+        return { success: true, qtyPurchased: task.quantity };
+      }
+      await placeOrderBtn.click();
+      await humanDelay(5000, 7000);
+      const confirmed = page.locator('[class*="thank-you"], h1:has-text("Thank You"), h1:has-text("Order"), [class*="confirmation"]').first();
+      if (await confirmed.isVisible({ timeout: 12000 }).catch(() => false)) {
+        await log("success", `🎉 ORDER PLACED on Best Buy! (${task.quantity} unit${task.quantity !== 1 ? "s" : ""})`);
+        await browser.close().catch(() => {});
+        return { success: true, qtyPurchased: task.quantity };
+      }
+      await log("warn", "Checkout submitted — verify in your Best Buy account");
+      await browser.close().catch(() => {});
+      return { success: true, qtyPurchased: task.quantity };
+    }
+
+    const title = await page.title().catch(() => "unknown");
+    await log("error", `Place Order button not found — page: "${title}" (${page.url()})`);
+    await browser.close().catch(() => {});
+    return { success: false, qtyPurchased: 0 };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await log("error", `Fast browser ATC error: ${msg.slice(0, 200)}`);
+    if (browser) await browser.close().catch(() => {});
+    return { success: false, qtyPurchased: 0 };
+  }
+}
+
+export async function runBestBuyBot(task: BotTask, profile: BotProfile, log: LogFn, signal: AbortSignal): Promise<BotResult> {
+  let browser: Browser | null = null;
+
+  // ── API FAST PATH: Node.js fetch + cookie injection ──────────────────────
+  // When the user has provided Best Buy session cookies we can skip the blocked
+  // product-page navigation entirely: add to cart via Node.js fetch (different
+  // TLS fingerprint → not blocked by Akamai) and jump straight to /checkout.
+  if (profile.bestbuyCookies && task.productUrl) {
+    const skuId = extractSkuId(task.productUrl);
+    if (skuId) {
+      const cartResult = await addToCartViaApi(skuId, profile.bestbuyCookies, task.quantity, log);
+      // Out of stock or unavailable — no point trying the browser, just wait next cycle
+      if (cartResult.result === "out_of_stock" || cartResult.result === "error") return { success: false, qtyPurchased: 0 };
+
+      // Item is API-blocked (ITEM_NOT_SELLABLE) — check the product page directly for an ATC button
+      // and if it's live, spin up the browser and click it
+      if (cartResult.result === "not_online_sellable") {
+        const pageHasAtc = await checkPageForAtc(task.productUrl, profile.bestbuyCookies);
+        if (!pageHasAtc) return { success: false, qtyPurchased: 0 };
+        await log("success", "🟢 ADD TO CART live on product page — launching fast browser checkout!");
+        return fastBrowserAtcAndCheckout(task, profile, log, signal);
+      }
+      if (cartResult.result === "added") {
+        const qtyInCart = cartResult.qtyAdded;
+        // Now launch browser, inject cookies, and go straight to checkout
+        try {
+          browser = await launchStealthBrowser();
+          const context = await createStealthContext(browser, profile.proxyUrl);
+
+          // ── Inject session cookies — normalize sameSite to Playwright-valid values
+          try {
+            const rawCookies: Array<Record<string, unknown>> = JSON.parse(profile.bestbuyCookies);
+            const normalizeSameSite = (v: unknown): "Strict" | "Lax" | "None" => {
+              if (!v || v === "null") return "Lax";
+              const s = String(v).toLowerCase();
+              if (s === "strict") return "Strict";
+              if (s === "none" || s === "no_restriction") return "None";
+              return "Lax";
+            };
+            await context.addCookies(
+              rawCookies.map((c) => ({
+                name: String(c.name),
+                value: String(c.value),
+                domain: String(c.domain ?? ".bestbuy.com"),
+                path: String(c.path ?? "/"),
+                secure: Boolean(c.secure ?? false),
+                httpOnly: Boolean(c.httpOnly ?? false),
+                sameSite: normalizeSameSite(c.sameSite),
+              }))
+            );
+            await log("info", `Injected ${rawCookies.length} session cookies into browser`);
+          } catch (e) {
+            await log("warn", `Cookie injection failed: ${e instanceof Error ? e.message : String(e)}`);
+          }
+
+          const page = await context.newPage();
+          await log("info", "Navigating to Best Buy cart → checkout...");
+
+          // Navigate to cart first so Best Buy sees the session + cart items before checkout
+          await page.goto("https://www.bestbuy.com/cart", { waitUntil: "domcontentloaded", timeout: 30000 });
+          await humanDelay(2000, 3500);
+          await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+
+          // Click Checkout from the cart page if visible
+          const cartCheckoutBtn = page.locator('button:has-text("Checkout"), a:has-text("Checkout")').first();
+          if (await cartCheckoutBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
+            await log("info", "Clicking Checkout from cart...");
+            await cartCheckoutBtn.click();
+            await page.waitForLoadState("domcontentloaded", { timeout: 30000 });
+            await humanDelay(2500, 4000);
+          } else {
+            // Already past cart or redirected — go directly to checkout
+            await page.goto("https://www.bestbuy.com/checkout/", { waitUntil: "domcontentloaded", timeout: 30000 });
+            await humanDelay(2500, 4000);
+          }
+
+          await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+          await log("info", `Checkout page: ${page.url()}`);
+
+          // ── Sign in if prompted ───────────────────────────────────────────
+          await log("info", `Checking sign-in state for ${profile.email}...`);
+          const emailInput = page.locator('input[name="fld-e"], input[type="email"], input[id*="email"]').first();
+          if (await emailInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+            await log("info", "Sign-in required — entering credentials...");
+            await emailInput.fill(profile.email);
+            await humanDelay(300, 600);
+            const continueBtn = page.locator('button:has-text("Continue"), button[type="submit"]').first();
+            await continueBtn.click();
+            await humanDelay(1500, 2500);
+            const passInput = page.locator('input[type="password"]').first();
+            if (await passInput.isVisible({ timeout: 4000 }).catch(() => false)) {
+              await passInput.fill(profile.password);
+              await humanDelay(300, 600);
+              const signinBtn = page.locator('button:has-text("Sign In"), button[type="submit"]').first();
+              await signinBtn.click();
+              await humanDelay(3000, 5000);
+              await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+            }
+          } else {
+            await log("info", "Session active — already signed in");
+          }
+
+          if (signal.aborted) { await browser.close().catch(() => {}); return { success: false, qtyPurchased: 0 }; }
+
+          // ── Shipping step ─────────────────────────────────────────────────
+          await log("info", "Confirming shipping...");
+          await humanDelay(2000, 3000);
+          const continueShipping = page.locator('button:has-text("Continue"), button:has-text("Next step"), button:has-text("Save & Continue")').first();
+          if (await continueShipping.isVisible({ timeout: 8000 }).catch(() => false)) {
+            await continueShipping.click();
+            await humanDelay(2000, 3000);
+          }
+
+          // ── Payment step ──────────────────────────────────────────────────
+          await log("info", `Entering payment: **** **** **** ${profile.cardNumber.slice(-4)}`);
+          await humanDelay(800, 1500);
+          const cardInput = page.locator('input[id*="credit-card-number"], input[name*="number"], input[autocomplete="cc-number"]').first();
+          if (await cardInput.isVisible({ timeout: 8000 }).catch(() => false)) {
+            await cardInput.fill(profile.cardNumber.replace(/\s/g, ""));
+            await humanDelay(300, 600);
+            const expInput = page.locator('input[id*="expiration"], input[autocomplete="cc-exp"]').first();
+            await expInput.fill(profile.cardExpiry.replace("/", ""));
+            await humanDelay(200, 500);
+            const cvvInput = page.locator('input[id*="cvv"], input[id*="cvc"], input[autocomplete="cc-csc"]').first();
+            await cvvInput.fill(profile.cardCvv);
+            await humanDelay(200, 400);
+          }
+          const continuePayment = page.locator('button:has-text("Continue"), button:has-text("Review Order"), button:has-text("Save & Continue")').first();
+          if (await continuePayment.isVisible({ timeout: 6000 }).catch(() => false)) {
+            await continuePayment.click();
+            await humanDelay(2000, 3000);
+          }
+
+          if (signal.aborted) { await browser.close().catch(() => {}); return { success: false, qtyPurchased: 0 }; }
+
+          // ── Place Order ───────────────────────────────────────────────────
+          await log("info", `Review page: ${page.url()}`);
+          await log("info", "Looking for Place Order button...");
+          await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+
+          // Best Buy uses various selectors depending on the checkout version
+          const placeOrderBtn = page.locator([
+            'button:has-text("Place Your Order")',
+            'button:has-text("Place Order")',
+            'button:has-text("Submit Order")',
+            'button[data-track*="place-order"]',
+            'button[data-track*="Place Order"]',
+            'button[class*="place-order"]',
+            '.checkout-buttons__checkout button',
+            'button[data-test*="place-order"]',
+          ].join(", ")).first();
+
+          if (await placeOrderBtn.isVisible({ timeout: 15000 }).catch(() => false)) {
+            if (task.dryRun) {
+              await log("success", "✓ DRY RUN COMPLETE — Place Order button found. No order was placed.");
+              await browser.close().catch(() => {});
+              return { success: true, qtyPurchased: qtyInCart };
+            }
+            await placeOrderBtn.click();
+            await humanDelay(5000, 7000);
+            const confirmed = page.locator('[class*="thank-you"], h1:has-text("Thank You"), h1:has-text("Order"), [class*="confirmation"], [class*="order-confirmation"]').first();
+            if (await confirmed.isVisible({ timeout: 15000 }).catch(() => false)) {
+              await log("success", `🎉 ORDER PLACED SUCCESSFULLY on Best Buy! (${qtyInCart} unit${qtyInCart !== 1 ? "s" : ""})`);
+              await browser.close().catch(() => {});
+              return { success: true, qtyPurchased: qtyInCart };
+            }
+            await log("error", "Could not confirm order — check your Best Buy account");
+            await browser.close().catch(() => {});
+            return { success: false, qtyPurchased: 0 };
+          }
+
+          // Log page title to help diagnose what page we actually landed on
+          const pageTitle = await page.title().catch(() => "unknown");
+          await log("error", `Place Order button not found — current page: "${pageTitle}" (${page.url()})`);
+          await browser.close().catch(() => {});
+          return { success: false, qtyPurchased: 0 };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await log("error", `Checkout error: ${msg.slice(0, 200)}`);
+          if (browser) await browser.close().catch(() => {});
+          return { success: false, qtyPurchased: 0 };
+        }
+      }
+      // Cart API failed — fall through to browser approach
+    }
+  }
+
+  try {
+    browser = await launchStealthBrowser();
+    const context = await createStealthContext(browser, profile.proxyUrl);
+    const page = await context.newPage();
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── NAVIGATE ──────────────────────────────────────────────────────────────
+    // Always warm up on the homepage first — Akamai flags direct deep-links
+    await log("info", "Navigating to bestbuy.com...");
+    await page.goto("https://www.bestbuy.com", { waitUntil: "domcontentloaded", timeout: 30000 });
+    await humanDelay(1500, 2500);
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+    await dismissPopups(page);
+
+    // Simulate human behavior on the homepage before touching any product page
+    await page.mouse.move(300 + Math.random() * 400, 200 + Math.random() * 200);
+    await humanDelay(200, 500);
+    await page.mouse.move(500 + Math.random() * 300, 350 + Math.random() * 200);
+    await humanDelay(200, 400);
+    await page.evaluate(() => window.scrollBy({ top: 300 + Math.random() * 200, behavior: "smooth" }));
+    await humanDelay(800, 1500);
+    await page.evaluate(() => window.scrollBy({ top: -(150 + Math.random() * 100), behavior: "smooth" }));
+    await humanDelay(600, 1200);
+
+    // Then navigate to the product page if a direct URL is set
+    if (task.productUrl) {
+      // Visit the search page as an intermediate step — less suspicious than a direct product jump
+      await log("info", "Browsing to product via search...");
+      const searchUrl = `https://www.bestbuy.com/site/searchpage.jsp?st=${encodeURIComponent(task.keywords)}`;
+      await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await humanDelay(2000, 3500);
+      await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+      await dismissPopups(page);
+
+      // Simulate scrolling through search results
+      await page.mouse.move(400 + Math.random() * 300, 300 + Math.random() * 200);
+      await humanDelay(300, 600);
+      await page.evaluate(() => window.scrollBy({ top: 250 + Math.random() * 150, behavior: "smooth" }));
+      await humanDelay(600, 1200);
+
+      await log("info", "Loading product page...");
+      // Use JS navigation instead of direct goto — looks like a user click to Akamai
+      await page.evaluate((url: string) => { window.location.href = url; }, task.productUrl);
+      await page.waitForLoadState("domcontentloaded", { timeout: 30000 });
+      await humanDelay(1500, 3000);
+      await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+      await dismissPopups(page);
+    }
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── SEARCH ────────────────────────────────────────────────────────────────
+    if (!task.productUrl) {
+      await log("info", `Searching for: "${task.keywords}"`);
+      const searchBox = page.locator([
+        'input[name="st"]',
+        'input[id="gh-search-input"]',
+        'input[aria-label*="Search" i]',
+        'input[placeholder*="Search" i]',
+        'input[class*="search-input"]',
+        'input[data-testid*="search"]',
+        'form[role="search"] input[type="text"]',
+        'header input[type="text"]',
+        'input[type="search"]',
+      ].join(", ")).first();
+      await searchBox.waitFor({ timeout: 15000 });
+      await searchBox.click();
+      await humanDelay(200, 500);
+      for (const char of task.keywords) {
+        await page.keyboard.type(char, { delay: Math.random() * 80 + 40 });
+      }
+      await humanDelay(400, 800);
+      await page.keyboard.press("Enter");
+      await page.waitForLoadState("domcontentloaded", { timeout: 20000 });
+      await humanDelay(2000, 3500);
+      await dismissPopups(page);
+
+      // ── FIND PRODUCT ────────────────────────────────────────────────────────
+      await log("info", "Scanning search results...");
+      const productLink = page.locator([
+        'a.image-link[href*="/site/"]',
+        'h4.sku-title a',
+        '.sku-title a',
+        'a[href*="/site/"][class*="product"]',
+        '[data-testid*="product"] a',
+        '.shop-sku-list-item a',
+        'ol.sku-list li a',
+      ].join(", ")).filter({ hasText: /riftbound|league|legends|topps|chrome|hanger/i }).first();
+      const genericLink = page.locator([
+        'a.image-link[href*="/site/"]',
+        'h4.sku-title a',
+        '.sku-title a',
+        'a[href*="/site/"][class*="product"]',
+        '[data-testid*="product"] a',
+      ].join(", ")).first();
+      const link = (await productLink.count()) > 0 ? productLink : genericLink;
+      const href = await link.getAttribute("href").catch(() => null);
+      if (!href) {
+        await log("warn", "No matching product found — item may be out of stock or not listed");
+        return { success: false, qtyPurchased: 0 };
+      }
+      const productPageUrl = href.startsWith("http") ? href : `https://www.bestbuy.com${href}`;
+      await log("info", "Found product — navigating to product page");
+      await page.goto(productPageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await humanDelay(2000, 3000);
+      await dismissPopups(page);
+    }
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── CHECK STOCK ───────────────────────────────────────────────────────────
+    await log("info", "Checking stock availability...");
+    const soldOutBtn = page.locator('button[data-button-state="SOLD_OUT"], button:has-text("Sold Out")').first();
+    const isSoldOut = await soldOutBtn.isVisible({ timeout: 3000 }).catch(() => false);
+    if (isSoldOut) {
+      await log("warn", "Item is sold out on Best Buy — will retry next cycle");
+      return { success: false, qtyPurchased: 0 };
+    }
+
+    const addToCartBtn = page.locator('button.add-to-cart-button, button[data-button-state="ADD_TO_CART"], button:has-text("Add to Cart")').first();
+    const isAvailable = await addToCartBtn.isVisible({ timeout: 8000 }).catch(() => false);
+    if (!isAvailable) {
+      await log("warn", "Add to Cart button not found — item may be unavailable");
+      return { success: false, qtyPurchased: 0 };
+    }
+
+    await log("success", "Item is in stock!");
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── ADD TO CART ───────────────────────────────────────────────────────────
+    await log("info", "Adding to cart...");
+    await addToCartBtn.click();
+    await humanDelay(2500, 4000);
+    await dismissPopups(page);
+
+    // ── GO TO CART ────────────────────────────────────────────────────────────
+    await log("info", "Proceeding to checkout...");
+    const goToCartBtn = page.locator('a:has-text("Go to Cart"), button:has-text("Go to Cart")').first();
+    if (await goToCartBtn.isVisible({ timeout: 6000 }).catch(() => false)) {
+      await goToCartBtn.click();
+      await humanDelay(1500, 2500);
+    } else {
+      await page.goto("https://www.bestbuy.com/cart", { waitUntil: "domcontentloaded", timeout: 30000 });
+      await humanDelay(1500, 2500);
+    }
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    const checkoutBtn = page.locator('button:has-text("Checkout"), a:has-text("Checkout")').first();
+    await checkoutBtn.waitFor({ timeout: 10000 });
+    await humanDelay(500, 1000);
+    await checkoutBtn.click();
+    await page.waitForLoadState("domcontentloaded", { timeout: 30000 });
+    await humanDelay(2500, 4000);
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── SIGN IN ───────────────────────────────────────────────────────────────
+    await log("info", `Signing in as ${profile.email}...`);
+    const emailInput = page.locator('input[name="fld-e"], input[type="email"], input[id*="email"]').first();
+    if (await emailInput.isVisible({ timeout: 8000 }).catch(() => false)) {
+      await emailInput.click();
+      await humanDelay(200, 400);
+      await emailInput.fill(profile.email);
+      await humanDelay(400, 700);
+      const continueEmailBtn = page.locator('button:has-text("Continue"), button[type="submit"]').first();
+      await continueEmailBtn.click();
+      await humanDelay(1500, 2500);
+
+      const passInput = page.locator('input[name="fld-p1"], input[type="password"]').first();
+      if (await passInput.isVisible({ timeout: 5000 }).catch(() => false)) {
+        await passInput.click();
+        await humanDelay(200, 400);
+        await passInput.fill(profile.password);
+        await humanDelay(400, 700);
+        const signinBtn = page.locator('button:has-text("Sign In"), button[type="submit"]').first();
+        await signinBtn.click();
+        await humanDelay(3000, 5000);
+        await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+      }
+    } else {
+      await log("info", "Already signed in or using guest checkout");
+    }
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── SHIPPING ──────────────────────────────────────────────────────────────
+    await log("info", `Confirming shipping to ${profile.address1}, ${profile.city}, ${profile.state}`);
+    await humanDelay(2000, 3000);
+    const continueShipping = page.locator('button:has-text("Continue"), button:has-text("Next step")').first();
+    if (await continueShipping.isVisible({ timeout: 6000 }).catch(() => false)) {
+      await continueShipping.click();
+      await humanDelay(1500, 2500);
+    }
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── PAYMENT ───────────────────────────────────────────────────────────────
+    await log("info", `Entering payment: **** **** **** ${profile.cardNumber.slice(-4)}`);
+    await humanDelay(800, 1500);
+
+    const cardNumberInput = page.locator(
+      'input[id*="credit-card-number"], input[name*="number"], input[autocomplete="cc-number"], input[placeholder*="Card number"]'
+    ).first();
+    if (await cardNumberInput.isVisible({ timeout: 8000 }).catch(() => false)) {
+      await cardNumberInput.click();
+      await humanDelay(200, 400);
+      await cardNumberInput.fill(profile.cardNumber.replace(/\s/g, ""));
+      await humanDelay(300, 600);
+
+      const expiryInput = page.locator('input[id*="expiration"], input[autocomplete="cc-exp"], input[placeholder*="MM/YY"]').first();
+      await expiryInput.click();
+      await humanDelay(200, 400);
+      await expiryInput.fill(profile.cardExpiry.replace("/", ""));
+      await humanDelay(300, 500);
+
+      const cvvInput = page.locator('input[id*="cvv"], input[id*="cvc"], input[autocomplete="cc-csc"]').first();
+      await cvvInput.click();
+      await humanDelay(200, 400);
+      await cvvInput.fill(profile.cardCvv);
+      await humanDelay(300, 500);
+    }
+
+    const continuePayment = page.locator('button:has-text("Continue"), button:has-text("Review Order")').first();
+    if (await continuePayment.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await continuePayment.click();
+      await humanDelay(1500, 2500);
+    }
+
+    if (signal.aborted) return { success: false, qtyPurchased: 0 };
+
+    // ── PLACE ORDER ───────────────────────────────────────────────────────────
+    await log("info", "Reviewing and placing order...");
+    await humanDelay(800, 1500);
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`));
+
+    const placeOrderBtn = page.locator(
+      'button:has-text("Place Your Order"), button:has-text("Place Order"), button[data-track*="place-order"]'
+    ).first();
+
+    if (await placeOrderBtn.isVisible({ timeout: 8000 }).catch(() => false)) {
+      if (task.dryRun) {
+        await log("success", "✓ DRY RUN COMPLETE — Place Order button found and all steps validated. No order was placed.");
+        return { success: true, qtyPurchased: task.quantity };
+      }
+      await placeOrderBtn.click();
+      await humanDelay(5000, 7000);
+      const successIndicator = page.locator('[class*="thank-you"], h1:has-text("Thank You"), h1:has-text("Order"), [class*="confirmation"]').first();
+      if (await successIndicator.isVisible({ timeout: 10000 }).catch(() => false)) {
+        await log("success", `Order placed successfully on Best Buy! (${task.quantity} unit${task.quantity !== 1 ? "s" : ""})`);
+        return { success: true, qtyPurchased: task.quantity };
+      } else {
+        await log("warn", "Checkout submitted — check your Best Buy account to verify the order");
+        return { success: true, qtyPurchased: task.quantity };
+      }
+    } else {
+      if (task.dryRun) {
+        await log("error", "✗ DRY RUN FAILED — Could not find Place Order button. Checkout layout may have changed.");
+      } else {
+        await log("error", "Could not find Place Order button — the site may have blocked the bot or requires manual steps");
+      }
+      return { success: false, qtyPurchased: 0 };
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("ERR_HTTP2_PROTOCOL_ERROR") || msg.includes("ERR_CONNECTION_REFUSED") || msg.includes("ERR_NETWORK_CHANGED")) {
+      await log("warn", "Best Buy blocked the browser connection (bot detection) — will retry next cycle");
+    } else {
+      await log("error", `Bot error: ${msg.slice(0, 200)}`);
+    }
+    return { success: false, qtyPurchased: 0 };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+
+
+// ============================================================
+// FILE: toppsBot.ts
+// ============================================================
+import type { Page, Browser } from "playwright";
+import { launchStealthBrowser, createStealthContext, humanDelay } from "./stealthBrowser";
+import { handleAnyCaptcha, solveTurnstile } from "./capSolver";
+import type { BotProfile, BotTask, LogFn } from "./dicksBot";
+
+// ── CLOUDFLARE DETECTION ──────────────────────────────────────────────────────
+
+/** Returns true if the current page is a Cloudflare challenge/block page */
+async function isCloudflareBlock(page: Page): Promise<boolean> {
+  const title = await page.title().catch(() => "");
+  const url = page.url();
+  if (
+    title.includes("Attention Required") ||
+    title.includes("Just a moment") ||
+    title.includes("Checking your browser") ||
+    url.includes("cdn-cgi/challenge-platform") ||
+    url.includes("challenges.cloudflare.com")
+  ) return true;
+
+  // Title can be empty mid-render — also check DOM body content for CF markers
+  const hasCfContent = await page.evaluate(() => {
+    const body = document.body?.innerText ?? "";
+    const html = document.documentElement?.innerHTML ?? "";
+    return (
+      body.includes("Attention Required") ||
+      body.includes("Click to reveal") ||
+      body.includes("Verify you are human") ||
+      html.includes("cdn-cgi/challenge-platform") ||
+      html.includes("challenges.cloudflare.com") ||
+      !!document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+      !!document.querySelector(".cf-error-details, #cf-error-details")
+    );
+  }).catch(() => false);
+
+  return hasCfContent;
+}
+
+/**
+ * Check for a Cloudflare block on the current page.
+ * If detected, attempts to solve via CapSolver Turnstile, then re-navigates to `returnUrl`.
+ * Returns true if the block was cleared (or wasn't present), false if it couldn't be solved.
+ */
+async function handleCloudflareThenGoTo(
+  page: Page,
+  returnUrl: string,
+  log: LogFn,
+  proxyUrl?: string
+): Promise<boolean> {
+  if (!(await isCloudflareBlock(page))) return true;
+  await log("warn", `⚠️ Cloudflare challenge detected — attempting to solve with proxy...`);
+  try {
+    const solved = await solveTurnstile(page, proxyUrl);
+    if (solved) {
+      await log("info", "Cloudflare challenge solved — re-navigating...");
+      await humanDelay(2000, 3000);
+      if (page.url() !== returnUrl) {
+        await page.goto(returnUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+        await humanDelay(1500, 2500);
+      }
+      return !(await isCloudflareBlock(page));
+    }
+    await log("warn", "⛔ CapSolver could not solve Cloudflare challenge. The proxy IP may be flagged. Try refreshing your Decodo proxy traffic allocation.");
+    return false;
+  } catch (e) {
+    await log("warn", `Cloudflare solve error: ${e instanceof Error ? e.message : String(e)}`);
+    return false;
+  }
+}
+
+// ── QUEUE DETECTION ──────────────────────────────────────────────────────────
+
+/** Returns true if the current page is a Queue-it (or similar) waiting room. */
+async function isInQueue(page: Page): Promise<boolean> {
+  const url = page.url();
+  if (
+    url.includes("queue-it.net") ||
+    url.includes("queueit") ||
+    url.includes("waiting-room") ||
+    url.includes("waitingroom") ||
+    url.includes("queueittoken")
+  ) return true;
+
+  // Also check DOM for Queue-it signature elements
+  const hasQueueDom = await page.evaluate(() => {
+    const ids = ["queueitmain", "MainPart", "divQueuePosition", "waitingroom", "h2QueueNumber"];
+    if (ids.some((id) => document.getElementById(id))) return true;
+    const text = document.body?.innerText?.toLowerCase() ?? "";
+    return (
+      text.includes("you are in line") ||
+      text.includes("you are in the queue") ||
+      text.includes("your position in line") ||
+      text.includes("estimated wait") ||
+      (text.includes("in line") && text.includes("position"))
+    );
+  }).catch(() => false);
+
+  return hasQueueDom;
+}
+
+/** Read the current queue position / estimated wait from the page, if available. */
+async function readQueueInfo(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const posEl =
+      document.getElementById("divQueuePosition") ??
+      document.getElementById("h2QueueNumber") ??
+      document.querySelector<HTMLElement>("[class*='queue-position'], [class*='queuePosition'], [id*='position']");
+
+    const waitEl =
+      document.getElementById("tdEstimatedWaitTime") ??
+      document.querySelector<HTMLElement>("[class*='estimated-wait'], [class*='estimatedWait'], [id*='wait']");
+
+    const pos = posEl?.innerText?.trim();
+    const wait = waitEl?.innerText?.trim();
+
+    if (pos && wait) return `Position: ${pos} — Est. wait: ${wait}`;
+    if (pos) return `Position in queue: ${pos}`;
+    if (wait) return `Estimated wait: ${wait}`;
+    return "In queue — position not available";
+  }).catch(() => "In queue — could not read position");
+}
+
+/**
+ * Waits through a Queue-it (or similar) virtual waiting room.
+ * Polls every 30 seconds, logs position updates, and resolves once the
+ * waiting room releases us back to the store. Times out after maxWaitMs.
+ *
+ * Returns true if we made it through, false if timed out or aborted.
+ */
+async function waitThroughQueue(
+  page: Page,
+  log: LogFn,
+  signal: AbortSignal,
+  maxWaitMs = 2 * 60 * 60 * 1000 // 2 hours
+): Promise<boolean> {
+  const deadline = Date.now() + maxWaitMs;
+  let lastLoggedMinute = -1;
+
+  await log("info", "Virtual queue detected — holding browser session open and waiting in line...");
+
+  while (Date.now() < deadline) {
+    if (signal.aborted) return false;
+
+    const stillInQueue = await isInQueue(page);
+    if (!stillInQueue) {
+      await log("success", "Queue released — proceeding to product page!");
+      return true;
+    }
+
+    // Log position every ~2 minutes to avoid flooding the log
+    const minutesWaited = Math.floor((Date.now() - (deadline - maxWaitMs)) / 60000);
+    if (minutesWaited !== lastLoggedMinute && minutesWaited % 2 === 0) {
+      lastLoggedMinute = minutesWaited;
+      const info = await readQueueInfo(page);
+      await log("info", `[Queue] ${info} (${minutesWaited}m waited)`);
+    }
+
+    // Wait 30 seconds before checking again — but honour abort signal
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, 30_000);
+      signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+    });
+  }
+
+  await log("warn", "Queue wait timed out after 2 hours — stopping task");
+  return false;
+}
+
+// ── POPUP DISMISSAL ──────────────────────────────────────────────────────────
+
+async function dismissPopups(page: Page) {
+  try {
+    const selectors = [
+      '[aria-label="Close"]',
+      'button:has-text("No Thanks")',
+      'button:has-text("Close")',
+      '[data-testid="close-button"]',
+      'button:has-text("Not Now")',
+      '.modal__close',
+      '[class*="close-btn"]',
+    ];
+    for (const sel of selectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await btn.click();
+        await humanDelay(300, 600);
+        break;
+      }
+    }
+  } catch {}
+}
+
+/**
+ * After clicking Add to Cart, Topps may show a "Sign in to purchase" modal.
+ * This tries to dismiss it by clicking "Continue as guest" or similar,
+ * or closes the modal so the cart drawer can open.
+ */
+async function handleLoginGate(page: Page, log: LogFn, email?: string, password?: string) {
+  try {
+    // First: check if there's a login form visible in a modal (Topps often shows this after Add to Cart)
+    const loginForm = page.locator('form[action*="/account/login"], input[name="customer[email]"]').first();
+    const hasLoginForm = await loginForm.isVisible({ timeout: 2000 }).catch(() => false);
+
+    if (hasLoginForm && email && password) {
+      await log("info", "Login modal detected — signing into Topps account...");
+      const emailField = page.locator('input[name="customer[email]"], input[type="email"]').first();
+      const passwordField = page.locator('input[name="customer[password]"], input[type="password"]').first();
+      if (await emailField.isVisible({ timeout: 3000 }).catch(() => false)) {
+        await emailField.fill(email);
+        await humanDelay(200, 400);
+      }
+      if (await passwordField.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await passwordField.fill(password);
+        await humanDelay(200, 400);
+        await passwordField.press("Enter");
+      }
+      await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+      await humanDelay(1500, 2500);
+      return;
+    }
+
+    // Second: look for a "Continue as guest" button
+    const guestSelectors = [
+      'button:has-text("Continue as guest")',
+      'button:has-text("Continue as Guest")',
+      'button:has-text("Guest Checkout")',
+      'button:has-text("Continue without signing in")',
+      'button:has-text("Skip")',
+      'a:has-text("Continue as guest")',
+      'a:has-text("Guest Checkout")',
+    ];
+    for (const sel of guestSelectors) {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await log("info", "Login gate — no credentials, continuing as guest");
+        await btn.click();
+        await humanDelay(800, 1500);
+        return;
+      }
+    }
+  } catch {}
+}
+
+// ── TOPPS LOGIN ───────────────────────────────────────────────────────────────
+
+/**
+ * Detects if the current page is a Topps/Shopify login wall and, if so,
+ * signs in using the profile credentials, then navigates back to returnUrl.
+ * Returns true if login succeeded (or wasn't needed), false on failure.
+ */
+async function loginToToppsIfNeeded(
+  page: Page,
+  email: string,
+  password: string,
+  returnUrl: string,
+  log: LogFn
+): Promise<boolean> {
+  try {
+    const url = page.url();
+    const isLoginPage =
+      url.includes("/account/login") ||
+      url.includes("/account/sign_in") ||
+      url.includes("/login") ||
+      !!(await page.locator('form[action*="/account/login"], input[name="customer[email]"]').first().isVisible({ timeout: 2000 }).catch(() => false));
+
+    if (!isLoginPage) return true; // no login wall — all clear
+
+    await log("info", "Login required — signing into Topps account...");
+
+    // Fill email
+    const emailField = page.locator(
+      'input[name="customer[email]"], input[type="email"][name*="email"], input[id*="email"]'
+    ).first();
+    if (await emailField.isVisible({ timeout: 5000 }).catch(() => false)) {
+      await emailField.click();
+      await humanDelay(200, 400);
+      await emailField.fill(email);
+      await humanDelay(300, 500);
+    } else {
+      await log("warn", "Login page detected but email field not found — proceeding as guest");
+      return false;
+    }
+
+    // Fill password
+    const passwordField = page.locator(
+      'input[name="customer[password]"], input[type="password"]'
+    ).first();
+    if (await passwordField.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await passwordField.click();
+      await humanDelay(200, 400);
+      await passwordField.fill(password);
+      await humanDelay(300, 600);
+    }
+
+    // Submit login form
+    const submitBtn = page.locator(
+      'button[type="submit"]:has-text("Sign in"), button[type="submit"]:has-text("Log in"), button[type="submit"]:has-text("Login"), input[type="submit"]'
+    ).first();
+    if (await submitBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await submitBtn.click();
+    } else {
+      // Fallback: submit via keyboard
+      await passwordField.press("Enter");
+    }
+
+    // Wait for redirect away from login page
+    await page.waitForURL((u) => !u.toString().includes("/account/login"), { timeout: 15000 }).catch(() => {});
+    await humanDelay(1500, 2500);
+
+    if (page.url().includes("/account/login")) {
+      await log("warn", "Login may have failed — still on login page (wrong password or CAPTCHA)");
+      return false;
+    }
+
+    await log("info", "✅ Logged in to Topps — navigating to product...");
+    await page.goto(returnUrl, { waitUntil: "commit", timeout: 30000 });
+    await humanDelay(1500, 2500);
+    return true;
+  } catch (err) {
+    await log("warn", `Login attempt error: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+// ── SHOPIFY PRODUCT API SCAN ─────────────────────────────────────────────────
+
+/**
+ * Queries the Topps Shopify product API directly by keyword.
+ * Returns { url, apiReachable } so callers can distinguish:
+ *   - apiReachable: true,  url: string  → found an in-stock match
+ *   - apiReachable: true,  url: null    → API responded but nothing in stock / no match
+ *   - apiReachable: false, url: null    → API blocked or network failure
+ */
+async function findToppsProductUrl(
+  keywords: string,
+  proxyUrl?: string | null
+): Promise<{ url: string | null; apiReachable: boolean; debugStatus?: number; debugError?: string }> {
+  const parts = keywords.split(",").map((k) => k.trim());
+  const positive = parts.filter((k) => k.startsWith("+")).map((k) => k.slice(1).trim().toLowerCase());
+  const negative = parts.filter((k) => k.startsWith("-")).map((k) => k.slice(1).trim().toLowerCase());
+  const searchQuery = (positive.length > 0 ? positive : parts).slice(0, 5).join(" ");
+  const encoded = encodeURIComponent(searchQuery);
+
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 12000);
+
+  try {
+    let response: Response;
+    if (proxyUrl) {
+      const { fetch: undiciFetch, ProxyAgent } = await import("undici");
+      const dispatcher = new ProxyAgent(proxyUrl);
+      response = await (undiciFetch as unknown as (url: string, init?: Record<string, unknown>) => Promise<Response>)(
+        `https://www.topps.com/products.json?q=${encoded}&limit=100`,
+        { dispatcher, headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json", "Accept-Language": "en-US,en;q=0.9" }, signal: ac.signal }
+      );
+    } else {
+      response = await fetch(
+        `https://www.topps.com/products.json?q=${encoded}&limit=100`,
+        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }, signal: ac.signal }
+      );
+    }
+    clearTimeout(timer);
+
+    if (!response.ok) {
+      return { url: null, apiReachable: false, debugStatus: response.status };
+    }
+
+    // Make sure we actually got JSON (CF sometimes returns 200 with HTML)
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.includes("json")) {
+      return { url: null, apiReachable: false, debugError: `non-JSON response (${contentType})` };
+    }
+
+    const data = await response.json() as { products?: Array<{ title: string; handle: string; variants: Array<{ available: boolean }> }> };
+    if (!data.products) return { url: null, apiReachable: false };
+
+    for (const product of data.products) {
+      const title = product.title.toLowerCase();
+      if (positive.length > 0 && !positive.every((k) => title.includes(k))) continue;
+      if (negative.some((k) => title.includes(k))) continue;
+      if (!product.variants.some((v) => v.available)) continue;
+      return { url: `https://www.topps.com/products/${product.handle}`, apiReachable: true };
+    }
+    // API responded but no match in stock
+    return { url: null, apiReachable: true };
+  } catch (err) {
+    clearTimeout(timer);
+    const cause = (err as { cause?: unknown })?.cause;
+    const causeMsg = cause instanceof Error ? cause.message : cause ? String(cause) : "";
+    const msg = err instanceof Error ? err.message : String(err);
+    return { url: null, apiReachable: false, debugError: causeMsg ? `${msg} — cause: ${causeMsg}` : msg };
+  }
+}
+
+// ── MAIN BOT ─────────────────────────────────────────────────────────────────
+
+async function runToppsBotImpl(
+  task: BotTask,
+  profile: BotProfile,
+  log: LogFn,
+  signal: AbortSignal
+): Promise<boolean> {
+  let browser: Browser | null = null;
+
+  try {
+    // ── FAST API PRE-SCAN ───────────────────────────────────────────────────
+    // Check Topps product API by keyword BEFORE launching browser.
+    // Only spin up Playwright when we know something is actually in stock.
+    await log("info", `🔎 Scanning Topps API for: "${task.keywords}"`);
+    const { url: apiUrl, apiReachable, debugStatus, debugError } = await findToppsProductUrl(task.keywords, profile.proxyUrl);
+
+    let targetUrl: string;
+    if (apiUrl) {
+      await log("info", `✅ In-stock product found via API — going to checkout: ${apiUrl}`);
+      targetUrl = apiUrl;
+    } else if (apiReachable) {
+      // API reached successfully but nothing matched — product not in stock yet
+      return false;
+    } else if (task.productUrl && task.productUrl.includes("/products/")) {
+      // API was blocked/unreachable — fall back to the configured product URL
+      const reason = debugError ?? (debugStatus ? `HTTP ${debugStatus}` : "unknown");
+      await log("warn", `Topps API unreachable via proxy (${reason}) — falling back to direct product URL`);
+      targetUrl = task.productUrl;
+    } else {
+      const reason = debugError ?? (debugStatus ? `HTTP ${debugStatus}` : "unknown");
+      await log("warn", `Topps API unreachable (${reason}) and no product URL configured — will retry next cycle`);
+      return false;
+    }
+
+    if (signal.aborted) return false;
+
+    browser = await launchStealthBrowser();
+    const context = await createStealthContext(browser, profile.proxyUrl);
+
+    // ── INJECT SAVED SESSION COOKIES ─────────────────────────────────────────
+    if (profile.toppsCookies) {
+      try {
+        const cookies = JSON.parse(profile.toppsCookies);
+        if (Array.isArray(cookies) && cookies.length > 0) {
+          // Ensure all cookies have the required domain field
+          const normalized = cookies.map((c: Record<string, unknown>) => ({
+            ...c,
+            domain: c.domain || ".topps.com",
+            path: c.path || "/",
+            sameSite: (c.sameSite as string) || "Lax",
+          }));
+          await context.addCookies(normalized);
+          await log("info", `Loaded ${normalized.length} saved session cookies — bot will appear logged in`);
+        }
+      } catch {
+        await log("warn", "Failed to parse Topps session cookies — proceeding as guest");
+      }
+    }
+
+    const page = await context.newPage();
+
+    if (signal.aborted) return false;
+
+    await dismissPopups(page);
+
+    // ── NAVIGATE DIRECTLY TO PRODUCT ────────────────────────────────────────
+    // targetUrl is already resolved by API pre-scan above — go straight there
+    await log("info", `Navigating to product page...`);
+    await page.goto(targetUrl, { waitUntil: "networkidle", timeout: 60000 }).catch(async () => {
+      // networkidle can time out on heavy pages — wait for domcontentloaded at minimum
+      await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+    });
+
+    // Give the Shopify React frontend time to hydrate (skeleton → real content)
+    await humanDelay(4000, 6000);
+
+    // If page still looks empty, try one reload
+    const initialTitle = await page.title().catch(() => "");
+    if (!initialTitle) {
+      await log("info", "Page title empty after wait — reloading once...");
+      await page.reload({ waitUntil: "networkidle", timeout: 30000 }).catch(() => {});
+      await humanDelay(3000, 5000);
+    }
+
+    // ── CLOUDFLARE CHALLENGE (solve before doing anything else) ──────────────
+    if (await isCloudflareBlock(page)) {
+      await log("warn", "⚠️ Cloudflare challenge detected after navigation — attempting solve...");
+
+      // Try CapSolver first
+      const cfCleared = await handleCloudflareThenGoTo(page, targetUrl, log, profile.proxyUrl);
+
+      // Fallback: directly click the "Click to reveal" / "Verify you are human" button
+      if (!cfCleared || await isCloudflareBlock(page)) {
+        await log("info", "CapSolver couldn't clear CF — trying direct button click...");
+        const cfBtn = page.locator(
+          'button:has-text("Click to reveal"), button:has-text("Verify you are human"), ' +
+          'button:has-text("I am not a robot"), input[type="submit"]'
+        ).first();
+        if (await cfBtn.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await cfBtn.click();
+          await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
+          await humanDelay(3000, 5000);
+        }
+      }
+
+      // If still blocked, skip this cycle and retry
+      if (await isCloudflareBlock(page)) {
+        await log("warn", "Cloudflare block persists — retrying next cycle");
+        return false;
+      }
+    }
+
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`), profile.proxyUrl);
+
+    // ── LOGIN WALL ───────────────────────────────────────────────────────────
+    // Topps drops often require a logged-in account. If we land on a login page,
+    // sign in using profile credentials and return to the product URL.
+    const loggedIn = await loginToToppsIfNeeded(page, profile.email, profile.password, targetUrl, log);
+    if (!loggedIn) {
+      await log("warn", "Could not log in — attempting to proceed as guest");
+    }
+
+    // ── QUEUE WAIT (if applicable) ───────────────────────────────────────────
+    if (await isInQueue(page)) {
+      await log("info", "Virtual queue detected — waiting in line...");
+      const passedQueue = await waitThroughQueue(page, log, signal);
+      if (!passedQueue) return false;
+      await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+      await humanDelay(2000, 3500);
+    }
+
+    await dismissPopups(page);
+
+    if (signal.aborted) return false;
+
+    // ── CLICK "SHOP NOW" IF PRESENT (landing page → product page) ────────────
+    // The Topps drop page is a landing/marketing page. The actual buyable product
+    // is reached by clicking "Shop Now" which navigates to the real product listing.
+    const shopNowBtn = page.locator(
+      'a:has-text("Shop Now"), a:has-text("Shop now"), button:has-text("Shop Now"), button:has-text("Shop now")'
+    ).first();
+    const hasShopNow = await shopNowBtn.isVisible({ timeout: 8000 }).catch(() => false);
+    if (hasShopNow) {
+      await log("info", "Landing page detected — clicking Shop Now...");
+      await shopNowBtn.click();
+      await page.waitForLoadState("domcontentloaded", { timeout: 20000 }).catch(() => {});
+      // Wait for the product form to appear on the destination page
+      await Promise.race([
+        page.waitForSelector('form[action*="/cart/add"], button[name="add"]', { timeout: 12000 }),
+        page.waitForSelector('button:has-text("Add to Cart"), button:has-text("Add To Cart")', { timeout: 12000 }),
+      ]).catch(() => {});
+      await humanDelay(800, 1500);
+      await log("info", `Shop Now clicked — now on: ${page.url()}`);
+    } else {
+      await log("info", "No Shop Now button found — assuming direct product page");
+    }
+
+    if (signal.aborted) return false;
+
+    const pageUrl = page.url();
+    const pageTitle = await page.title().catch(() => "");
+    await log("info", `Page loaded: "${pageTitle || "(skeleton)"}" | ${pageUrl}`);
+    await page.screenshot({ path: "/tmp/topps-debug.png", fullPage: false }).catch(() => {});
+
+    // ── API-FIRST: fetch product JSON from within the browser (same origin, no CORS) ──
+    // This works even when the page is in skeleton/loading state because the browser
+    // is already on topps.com — we call Shopify's internal fetch endpoints directly.
+    await log("info", "Fetching product data via Shopify JSON API...");
+
+    // Extract the product handle from the current URL or the target URL
+    const productHandle = (() => {
+      const m = pageUrl.match(/\/products\/([^/?#]+)/);
+      return m ? m[1] : null;
+    })();
+
+    type ShopifyVariant = { id: number; title: string; available: boolean; price: string };
+    type ProductJsonResult = { variantId: string | null; price: number | null; error: string | null; allVariants: Array<{ id: number; title: string; available: boolean }> };
+
+    const productJsonResult: ProductJsonResult = await page.evaluate(async ({ handle, targetUrl }: { handle: string | null; targetUrl: string }) => {
+      const urls = [
+        handle ? `/products/${handle}.json` : null,
+        // Also try fetching the "Shop Now" linked product by scanning anchor hrefs in the DOM
+      ].filter(Boolean) as string[];
+
+      // Scan ALL <a href="/products/..."> in the DOM — prioritise hobby/shop-now links first
+      const anchors = Array.from(document.querySelectorAll("a[href*='/products/']"));
+      const hobbyLinks: string[] = [];
+      const otherLinks: string[] = [];
+      for (const a of anchors) {
+        const href = (a as HTMLAnchorElement).href;
+        const text = (a.textContent ?? "").toLowerCase();
+        const m = href.match(/\/products\/([^/?#]+)/);
+        if (!m) continue;
+        const jsonUrl = `/products/${m[1]}.json`;
+        if (text.includes("shop") || text.includes("hobby") || text.includes("buy") || text.includes("baseball")) {
+          hobbyLinks.push(jsonUrl);
+        } else {
+          otherLinks.push(jsonUrl);
+        }
+      }
+      urls.push(...hobbyLinks, ...otherLinks);
+
+      // Deduplicate
+      const seen = new Set<string>();
+      const deduped = urls.filter((u) => { if (seen.has(u)) return false; seen.add(u); return true; });
+
+      for (const url of deduped) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) continue;
+          const data = (await res.json()) as { product?: { variants?: ShopifyVariant[] } };
+          const variants: ShopifyVariant[] = data.product?.variants ?? [];
+          if (!variants.length) continue;
+
+          // Prefer the hobby variant; fall back to the first available one
+          const hobbyVariant = variants.find((v) => v.title.toLowerCase().includes("hobby") && v.available)
+            ?? variants.find((v) => v.available)
+            ?? variants[0];
+
+          const price = hobbyVariant ? parseFloat(hobbyVariant.price) / 100 : null;
+          return {
+            variantId: hobbyVariant ? String(hobbyVariant.id) : null,
+            price,
+            error: null,
+            allVariants: variants.map((v) => ({ id: v.id, title: v.title, available: v.available })),
+          };
+        } catch (e) {
+          // continue
+        }
+      }
+      return { variantId: null, price: null, error: "no product JSON reachable", allVariants: [] };
+    }, { handle: productHandle, targetUrl }).catch(() => ({ variantId: null, price: null, error: "evaluate failed", allVariants: [] }));
+
+    await log("info", `Product JSON result: variantId=${productJsonResult.variantId} price=${productJsonResult.price} variants=${JSON.stringify(productJsonResult.allVariants)}`);
+
+    if (!productJsonResult.variantId) {
+      await log("warn", `Could not get variant via API (${productJsonResult.error}) — item not available yet`);
+      return false;
+    }
+
+    const variantId = productJsonResult.variantId;
+
+    // ── PRICE CHECK ───────────────────────────────────────────────────────────
+    if (task.maxPrice != null && productJsonResult.price != null) {
+      const price = productJsonResult.price;
+      await log("info", `Product price: $${price.toFixed(2)} | Max allowed: $${task.maxPrice.toFixed(2)}`);
+      if (price > task.maxPrice) {
+        await log("warn", `Skipping — price $${price.toFixed(2)} exceeds your $${task.maxPrice.toFixed(2)} cap`);
+        return false;
+      }
+    }
+
+    await log("success", `Hobby Box found! Variant ${variantId} — adding to cart via API...`);
+
+    if (signal.aborted) return false;
+
+    // ── ADD TO CART + GET CHECKOUT URL (pure Shopify API, no UI needed) ───────
+    const apiAddAndGetCheckout = async (vid: string): Promise<string | null> => {
+      return page.evaluate(
+        async ({ vid, qty }: { vid: string; qty: number }) => {
+          try {
+            await fetch("/cart/clear.js", { method: "POST" });
+            const addRes = await fetch("/cart/add.js", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ id: parseInt(vid, 10), quantity: qty }),
+            });
+            if (!addRes.ok) {
+              const err = await addRes.text().catch(() => "");
+              return `ERROR:${addRes.status}:${err.slice(0, 80)}`;
+            }
+            const cartRes = await fetch("/cart.json");
+            const cartData = (await cartRes.json()) as Record<string, unknown>;
+            return (cartData.checkout_url as string) ?? "/checkout";
+          } catch (e) {
+            return null;
+          }
+        },
+        { vid, qty: task.quantity }
+      );
+    };
+
+    const getCheckoutUrlFromCart = async (): Promise<string | null> => {
+      return page.evaluate(async () => {
+        try {
+          const res = await fetch("/cart.json");
+          const data = (await res.json()) as Record<string, unknown>;
+          const items = data.items as Array<Record<string, unknown>> | undefined;
+          if (!items || items.length === 0) return null;
+          return (data.checkout_url as string) ?? "/checkout";
+        } catch { return null; }
+      }).catch(() => null);
+    };
+
+    let checkoutUrl: string | null = null;
+
+    const apiResult = await apiAddAndGetCheckout(variantId);
+    if (apiResult && !apiResult.startsWith("ERROR:")) {
+      checkoutUrl = apiResult;
+      await log("success", `Cart API succeeded — checkout: ${checkoutUrl}`);
+    } else {
+      await log("warn", `Cart API response: ${apiResult} — trying login then retry`);
+      // Try signing in, then retry add-to-cart
+      await handleLoginGate(page, log, profile.email, profile.password);
+      await humanDelay(1000, 2000);
+      const retryResult = await apiAddAndGetCheckout(variantId);
+      if (retryResult && !retryResult.startsWith("ERROR:")) {
+        checkoutUrl = retryResult;
+        await log("success", `Cart API succeeded after login — checkout: ${checkoutUrl}`);
+      } else {
+        await log("warn", `Cart API still failing (${retryResult}) — using /checkout directly`);
+        checkoutUrl = "/checkout";
+      }
+    }
+
+    // Navigate directly to the checkout URL using a JS-triggered navigation.
+    // This is more natural to Cloudflare than Playwright's programmatic goto().
+    const fullCheckoutUrl = checkoutUrl.startsWith("http")
+      ? checkoutUrl
+      : `https://www.topps.com${checkoutUrl}`;
+    await log("info", `Going to checkout: ${fullCheckoutUrl}`);
+    // Use JS navigation to mimic a real user click — CF treats this differently than automated goto
+    await page.evaluate((url) => { window.location.assign(url); }, fullCheckoutUrl);
+    await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+    await humanDelay(1000, 2000);
+
+    // ── Cloudflare check immediately after entering checkout ──────────────────
+    // Use page.url() so we re-navigate to the actual checkout URL (e.g. /checkouts/cn/...)
+    const cfClearedAtCheckout = await handleCloudflareThenGoTo(page, page.url(), log, profile.proxyUrl);
+    if (!cfClearedAtCheckout) return false;
+
+    // Queue can appear at checkout too during high-demand drops
+    if (await isInQueue(page)) {
+      await log("info", "Queue triggered at checkout — waiting...");
+      const passed = await waitThroughQueue(page, log, signal);
+      if (!passed) return false;
+      await page.waitForLoadState("domcontentloaded", { timeout: 30000 }).catch(() => {});
+      await humanDelay(2000, 3000);
+    }
+
+    if (signal.aborted) return false;
+
+    // ── Helper: click a button and wait for the page to advance ──────────────
+    const clickAndAdvance = async (selector: string, label: string): Promise<boolean> => {
+      const btn = page.locator(selector).first();
+      const visible = await btn.isVisible({ timeout: 6000 }).catch(() => false);
+      if (!visible) { await log("info", `${label}: button not found — skipping`); return false; }
+      const urlBefore = page.url();
+      await btn.click();
+      // Wait up to 4s for URL to change OR new content to appear
+      await Promise.race([
+        page.waitForURL((u) => u.toString() !== urlBefore, { timeout: 4000 }).catch(() => {}),
+        humanDelay(2500, 3500),
+      ]);
+      await log("info", `${label}: clicked → now on ${page.url()}`);
+      return true;
+    };
+
+    // ── CONTACT INFO ─────────────────────────────────────────────────────────
+    await log("info", `Entering contact info for ${profile.email}...`);
+    await log("info", `[Checkout step] URL: ${page.url()}`);
+    const emailInput = page.locator(
+      'input[type="email"], input[name="email"], input[id*="email"], input[autocomplete="email"]'
+    ).first();
+    if (await emailInput.isVisible({ timeout: 10000 }).catch(() => false)) {
+      await emailInput.click();
+      await humanDelay(200, 400);
+      await emailInput.fill(profile.email);
+      await humanDelay(300, 600);
+    }
+
+    // ── SHIPPING ADDRESS ─────────────────────────────────────────────────────
+    await log("info", "Filling shipping address...");
+    const fields: Array<[string, string]> = [
+      ['input[name="firstName"], input[autocomplete="given-name"]', profile.firstName],
+      ['input[name="lastName"], input[autocomplete="family-name"]', profile.lastName],
+      ['input[name="address1"], input[autocomplete="address-line1"]', profile.address1],
+      ...(profile.address2 ? [['input[name="address2"], input[autocomplete="address-line2"]', profile.address2] as [string, string]] : []),
+      ['input[name="city"], input[autocomplete="address-level2"]', profile.city],
+      ['input[name="zip"], input[autocomplete="postal-code"]', profile.zip],
+      ['input[name="phone"], input[type="tel"]', profile.phone],
+    ];
+    for (const [selector, value] of fields) {
+      const el = page.locator(selector).first();
+      if (await el.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await el.fill(value);
+        await humanDelay(150, 350);
+      }
+    }
+
+    const stateSelect = page.locator('select[name="zone"], select[name="state"], select[id*="state"]').first();
+    if (await stateSelect.isVisible({ timeout: 2000 }).catch(() => false)) {
+      await stateSelect.selectOption({ value: profile.state });
+      await humanDelay(200, 400);
+    }
+
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`), profile.proxyUrl);
+
+    // Click "Continue to shipping" — advances from address → shipping method
+    await clickAndAdvance(
+      'button:has-text("Continue to shipping"), button[data-testid="step-footer-continue-btn"], button:has-text("Continue to delivery"), button[data-testid*="continue"]',
+      "Continue to shipping"
+    );
+
+    if (signal.aborted) return false;
+
+    // ── SHIPPING METHOD ──────────────────────────────────────────────────────
+    await log("info", `Selecting shipping method — URL: ${page.url()}`);
+    await humanDelay(1000, 2000);
+    // Pick the first/cheapest shipping option if not already selected
+    const shippingOption = page.locator('input[type="radio"][name*="shipping"], input[type="radio"][name*="delivery"]').first();
+    if (await shippingOption.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await shippingOption.check().catch(() => {});
+      await humanDelay(400, 800);
+    }
+
+    // Click "Continue to payment" — advances from shipping method → payment
+    await clickAndAdvance(
+      'button:has-text("Continue to payment"), button[data-testid="step-footer-continue-btn"]',
+      "Continue to payment"
+    );
+
+    if (signal.aborted) return false;
+
+    // ── Cloudflare check before payment ──────────────────────────────────────
+    const cfClearedBeforePayment = await handleCloudflareThenGoTo(page, page.url(), log, profile.proxyUrl);
+    if (!cfClearedBeforePayment) return false;
+    await log("info", `[Payment step] URL: ${page.url()}`);
+
+    // ── PAYMENT ──────────────────────────────────────────────────────────────
+    await log("info", `Entering payment: **** **** **** ${profile.cardNumber.slice(-4)}`);
+    await humanDelay(1500, 2500);
+
+    // Diagnostic: log all iframes on the checkout page so we can debug selectors
+    const iframeNames = await page.evaluate(() =>
+      [...document.querySelectorAll("iframe")].map(f => `id=${f.id} name=${f.name} src=${f.src.substring(0, 60)}`)
+    ).catch(() => []);
+    if (iframeNames.length) await log("info", `[Payment debug] iframes: ${iframeNames.join(" | ")}`);
+
+    let paymentFilled = false;
+
+    // ── Strategy 1: Shopify new checkout — one iframe PER field ──────────────
+    // e.g. iframe[name="card-fields-number"], iframe[name="card-fields-expiry"], etc.
+    const numberFrameEl = await page.$('iframe[name*="number"][name*="card"], iframe[id*="card-fields-number"]');
+    if (numberFrameEl) {
+      await log("info", "Using Shopify split-iframe payment fields");
+      const numberFrame   = page.frameLocator('iframe[name*="number"][name*="card"], iframe[id*="card-fields-number"]').first();
+      const expiryFrame   = page.frameLocator('iframe[name*="expiry"], iframe[id*="card-fields-expiry"]').first();
+      const cvvFrame      = page.frameLocator('iframe[name*="verification"], iframe[name*="cvv"], iframe[id*="card-fields-verification"]').first();
+      const nameFrame     = page.frameLocator('iframe[name*="name"][name*="card"], iframe[id*="card-fields-name"]').first();
+
+      const numberInput = numberFrame.locator('input').first();
+      if (await numberInput.isVisible({ timeout: 6000 }).catch(() => false)) {
+        await numberInput.fill(profile.cardNumber.replace(/\s/g, ""));
+        await humanDelay(300, 500);
+      }
+      const expiryInput = expiryFrame.locator('input').first();
+      if (await expiryInput.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await expiryInput.fill(profile.cardExpiry);
+        await humanDelay(300, 500);
+      }
+      const cvvInput = cvvFrame.locator('input').first();
+      if (await cvvInput.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await cvvInput.fill(profile.cardCvv);
+        await humanDelay(200, 400);
+      }
+      const nameInput = nameFrame.locator('input').first();
+      if (await nameInput.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await nameInput.fill(profile.cardName);
+        await humanDelay(200, 400);
+      }
+      paymentFilled = true;
+    }
+
+    // ── Strategy 2: Shopify classic checkout — single combined iframe ─────────
+    if (!paymentFilled) {
+      const singleFrame = page.frameLocator('iframe[src*="pay.shopify"], iframe[name="card-fields"]').first();
+      const singleNumber = singleFrame.locator('input[name="number"], input[placeholder*="Card number"]').first();
+      if (await singleNumber.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await log("info", "Using Shopify classic combined payment iframe");
+        await singleNumber.fill(profile.cardNumber.replace(/\s/g, ""));
+        await humanDelay(300, 600);
+        await singleFrame.locator('input[name="expiry"], input[placeholder*="MM"]').first().fill(profile.cardExpiry);
+        await humanDelay(300, 500);
+        await singleFrame.locator('input[name="verification_value"], input[placeholder*="CVV"], input[placeholder*="Security"]').first().fill(profile.cardCvv);
+        await humanDelay(200, 400);
+        const nameField = singleFrame.locator('input[name="name"], input[placeholder*="Name on card"]').first();
+        if (await nameField.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await nameField.fill(profile.cardName);
+        }
+        paymentFilled = true;
+      }
+    }
+
+    // ── Strategy 3: Direct inputs on page (non-iframe payment) ───────────────
+    if (!paymentFilled) {
+      const directNumber = page.locator(
+        'input[autocomplete="cc-number"], input[name*="cardNumber"], input[placeholder*="Card number"]'
+      ).first();
+      if (await directNumber.isVisible({ timeout: 4000 }).catch(() => false)) {
+        await log("info", "Using direct (non-iframe) payment fields");
+        await directNumber.fill(profile.cardNumber.replace(/\s/g, ""));
+        await humanDelay(300, 600);
+        await page.locator('input[autocomplete="cc-exp"], input[placeholder*="MM"]').first().fill(profile.cardExpiry);
+        await humanDelay(300, 500);
+        await page.locator('input[autocomplete="cc-csc"], input[placeholder*="CVV"], input[placeholder*="Security"]').first().fill(profile.cardCvv);
+        await humanDelay(200, 400);
+        paymentFilled = true;
+      }
+    }
+
+    if (!paymentFilled) {
+      // May have a saved payment method already selected — log for visibility but don't bail
+      await log("info", "No new card fields found — likely using saved payment method, proceeding to Place Order...");
+    }
+
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`), profile.proxyUrl);
+
+    if (signal.aborted) return false;
+
+    // ── PLACE ORDER ──────────────────────────────────────────────────────────
+    await log("info", "Reviewing order and placing...");
+
+    // ── Cloudflare check before placing order ─────────────────────────────────
+    const cfClearedBeforeOrder = await handleCloudflareThenGoTo(page, page.url(), log, profile.proxyUrl);
+    if (!cfClearedBeforeOrder) return false;
+
+    // Give Shopify extra time to validate the payment section before revealing the button
+    await humanDelay(2500, 4000);
+    await handleAnyCaptcha(page, (msg) => log("info", `[CapSolver] ${msg}`), profile.proxyUrl);
+
+    // Log page state before looking for Pay Now button
+    const prePayTitle = await page.title().catch(() => "");
+    const prePayUrl = page.url();
+    await log("info", `[Place Order step] URL: ${prePayUrl} | Title: ${prePayTitle}`);
+
+    // Shopify checkout Pay Now button — many variants across Shopify versions
+    const PAY_BTN_SELECTORS = [
+      // Shopify new checkout (2023+)
+      'button[data-testid="Checkout-Pay-button"]',
+      'button[data-testid="pay-now"]',
+      'button[data-testid="checkout-pay-button"]',
+      // ID-based
+      '#checkout-pay-button',
+      'button[id*="pay-now"]',
+      'button[id*="pay_now"]',
+      // Aria
+      'button[aria-label*="Pay now" i]',
+      'button[aria-label*="Pay Now" i]',
+      'button[aria-label*="Complete order" i]',
+      // Text-based
+      'button:has-text("Pay now")',
+      'button:has-text("Pay Now")',
+      'button:has-text("Complete order")',
+      'button:has-text("Complete Order")',
+      'button:has-text("Place order")',
+      'button:has-text("Place Order")',
+      'button:has-text("Submit order")',
+      'button:has-text("Confirm order")',
+      // Class-based
+      'button.step__footer__continue-btn',
+      // Type+attr
+      'button[type="submit"][class*="pay"]',
+      'button[type="submit"][id*="pay"]',
+      'form[data-payment-form] button[type="submit"]',
+      // Last resort: any visible submit button on checkout pages
+      '.section--payment-method button[type="submit"]',
+      '[data-checkout-payment-submit] button',
+    ].join(", ");
+
+    const placeOrderBtn = page.locator(PAY_BTN_SELECTORS).first();
+
+    // Try harder — wait up to 15s since Shopify can be slow after entering payment
+    const btnVisible = await placeOrderBtn.isVisible({ timeout: 15000 }).catch(() => false);
+
+    if (btnVisible) {
+      if (task.dryRun) {
+        await log("success", "✓ DRY RUN COMPLETE — Pay Now button found and all steps validated. No order was placed.");
+        return true;
+      }
+      await log("info", `Clicking Pay Now / Place Order button...`);
+      await placeOrderBtn.click();
+      await humanDelay(5000, 8000);
+      const successIndicator = page.locator(
+        'h2:has-text("Thank you"), h1:has-text("Thank you"), [class*="confirmation"], [class*="thank-you"], text=/order.*confirm/i'
+      ).first();
+      if (await successIndicator.isVisible({ timeout: 12000 }).catch(() => false)) {
+        await log("success", "🎉 Order placed successfully on Topps!");
+        return true;
+      } else {
+        // Button was clicked — can't confirm visually but order was likely submitted
+        await log("warn", "Checkout submitted — check your Topps account to verify the order");
+        return true;
+      }
+    } else {
+      // Dump page title + URL so we can see where the bot actually ended up
+      const title = await page.title().catch(() => "unknown");
+      const url = page.url();
+      if (task.dryRun) {
+        await log("error", `✗ DRY RUN FAILED — Pay Now button not found on "${title}" (${url})`);
+      } else {
+        await log("error", `Could not find Pay Now button — page: "${title}" (${url})`);
+      }
+      return false;
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await log("error", `Bot error: ${msg.slice(0, 200)}`);
+    return false;
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+/** Public-facing wrapper — returns BotResult for quantity tracking */
+export async function runToppsBot(
+  task: BotTask,
+  profile: BotProfile,
+  log: LogFn,
+  signal: AbortSignal
+): Promise<import("./dicksBot").BotResult> {
+  const success = await runToppsBotImpl(task, profile, log, signal);
+  return { success, qtyPurchased: success ? task.quantity : 0 };
+}
+
+
+
+// ============================================================
+// FILE: botRunner.ts
+// ============================================================
+import { db, tasksTable, botLogsTable, profilesTable } from "@workspace/db"; // profilesTable used in dry run
+import { eq } from "drizzle-orm";
+import { logger } from "./logger";
+import { runDicksBot } from "./dicksBot";
+import { runBestBuyBot } from "./bestbuyBot";
+import { runToppsBot } from "./toppsBot";
+import { fastCheckStock, checkBestBuyStoreAvailability, type Site } from "./stockChecker";
+
+interface ActiveBot {
+  abortController: AbortController;
+  running: boolean;
+}
+
+const activeBots = new Map<number, ActiveBot>();
+
+// Tracks when we last ran the store availability check per task (ms timestamp)
+const lastStoreCheckMap = new Map<number, number>();
+const STORE_CHECK_INTERVAL_MS = 60_000;
+
+// ── Quantity tracking ──────────────────────────────────────────────────────
+// Tracks how many units have been purchased so far for each running task.
+// Reset to 0 whenever a bot starts from idle/stopped.
+const purchasedQtyMap = new Map<number, number>();
+
+async function addLog(taskId: number, level: string, message: string) {
+  try {
+    await db.insert(botLogsTable).values({ taskId, level, message });
+  } catch (err) {
+    logger.error({ err }, "Failed to write bot log");
+  }
+}
+
+async function runBotCycle(taskId: number, signal: AbortSignal): Promise<void> {
+  const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId));
+  if (!task || task.status !== "running") return;
+
+  const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, task.profileId));
+  if (!profile) {
+    await addLog(taskId, "error", "Profile not found — stopping task");
+    await db.update(tasksTable).set({ status: "failed", updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
+    stopBot(taskId);
+    return;
+  }
+
+  await db.update(tasksTable).set({ lastRunAt: new Date(), updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
+
+  const log = (level: string, message: string) => addLog(taskId, level, message);
+
+  const botFn = task.site === "dicks"
+    ? runDicksBot
+    : task.site === "topps"
+      ? runToppsBot
+      : runBestBuyBot;
+
+  const profileData = {
+    email: profile.email,
+    password: profile.password,
+    firstName: profile.firstName,
+    lastName: profile.lastName,
+    phone: profile.phone,
+    address1: profile.address1,
+    address2: profile.address2,
+    city: profile.city,
+    state: profile.state,
+    zip: profile.zip,
+    cardNumber: profile.cardNumber,
+    cardExpiry: profile.cardExpiry,
+    cardCvv: profile.cardCvv,
+    cardName: profile.cardName,
+    toppsCookies: profile.toppsCookies,
+    bestbuyCookies: profile.bestbuyCookies,
+    proxyUrl: profile.proxyUrl,
+  };
+
+  // How many have we already purchased this session?
+  const purchasedSoFar = purchasedQtyMap.get(taskId) ?? 0;
+  const remainingQty = Math.max(1, task.quantity - purchasedSoFar);
+
+  const taskData = {
+    id: task.id,
+    keywords: task.keywords,
+    productUrl: task.productUrl,
+    quantity: remainingQty, // only request what we still need
+    maxPrice: task.maxPrice,
+  };
+
+  const result = await botFn(taskData, profileData, log, signal);
+
+  // ── Best Buy store availability check (every 60s, non-blocking) ────────────
+  // Fires in the background so it never slows down the fast-check loop.
+  // Logs which cities have the item, with an ALL-CAPS DALLAS alert.
+  if (task.site === "bestbuy" && task.productUrl && profile.bestbuyCookies) {
+    const now = Date.now();
+    const lastCheck = lastStoreCheckMap.get(taskId) ?? 0;
+    if (now - lastCheck >= STORE_CHECK_INTERVAL_MS) {
+      lastStoreCheckMap.set(taskId, now);
+      checkBestBuyStoreAvailability(task.productUrl, profile.bestbuyCookies, profile.proxyUrl)
+        .then(({ available, unavailable, dallasHasIt, blocked }) => {
+          if (blocked) {
+            return addLog(taskId, "info", "Store tracker — all metro checks blocked (proxy may need refreshing)");
+          }
+          if (available.length === 0 && unavailable.length === 0) return;
+          const parts: string[] = [];
+          if (available.length > 0) parts.push(`IN STOCK: ${available.join(", ")}`);
+          if (unavailable.length > 0) parts.push(`no stock: ${unavailable.join(", ")}`);
+          const detail = parts.join(" | ");
+          if (dallasHasIt) {
+            return addLog(
+              taskId,
+              "success",
+              `🚨 *** DALLAS HAS STOCK! *** — ${detail.toUpperCase()} — PURCHASING NOW!`
+            );
+          }
+          return addLog(taskId, "info", `Store drop tracker — ${detail}`);
+        })
+        .catch(() => {/* silently skip if check fails */});
+    }
+  }
+
+  if (result.success && result.qtyPurchased > 0) {
+    const newTotal = purchasedSoFar + result.qtyPurchased;
+    purchasedQtyMap.set(taskId, newTotal);
+
+    if (newTotal >= task.quantity) {
+      // All units acquired — mark the task complete and stop
+      await addLog(
+        taskId,
+        "success",
+        `✅ All ${newTotal} of ${task.quantity} unit${task.quantity !== 1 ? "s" : ""} purchased — task complete!`
+      );
+      await db
+        .update(tasksTable)
+        .set({ status: "success", successAt: new Date(), updatedAt: new Date() })
+        .where(eq(tasksTable.id, taskId));
+      stopBot(taskId);
+    } else {
+      // Partial fill — keep hunting the remainder
+      const stillNeed = task.quantity - newTotal;
+      await addLog(
+        taskId,
+        "info",
+        `✔ ${newTotal} of ${task.quantity} purchased — still hunting ${stillNeed} more...`
+      );
+      // Task stays "running" — the loop will call runBotCycle again with reduced qty
+    }
+  }
+}
+
+export function startBot(taskId: number): void {
+  if (activeBots.has(taskId)) return;
+
+  // Reset purchased count — fresh hunt from 0
+  purchasedQtyMap.set(taskId, 0);
+
+  const abortController = new AbortController();
+  const bot: ActiveBot = { abortController, running: true };
+  activeBots.set(taskId, bot);
+
+  async function loop() {
+    // ── FAST CHECK LOOP ───────────────────────────────────────────────────────
+    // If a direct product URL is known, hammer it with lightweight HTTP checks
+    // every 750ms. Only launch the full browser/API when we confirm in-stock.
+    // If no URL is configured, fall straight through to the full browser cycle.
+
+    // Track heartbeat logging — confirm the bot is alive every 10s
+    let lastHeartbeatMs = 0;
+    let checkCount = 0;
+    const HEARTBEAT_INTERVAL_MS = 10_000;
+
+    while (bot.running && !abortController.signal.aborted) {
+      checkCount++;
+      const [task] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).catch(() => [null]);
+      if (!task || task.status !== "running") {
+        bot.running = false;
+        activeBots.delete(taskId);
+        return;
+      }
+
+      if (task.productUrl) {
+        // ── Fast pre-check ───────────────────────────────────────────────────
+        // Skip the HTTP pre-check for Best Buy when session cookies are present:
+        // the cart API itself is the fastest and most reliable stock signal —
+        // a plain unauthenticated HTTP fetch adds latency without improving accuracy.
+        const [profileForCheck] = await db.select().from(profilesTable).where(eq(profilesTable.id, task.profileId)).catch(() => [null]);
+        const skipFastCheck = task.site === "bestbuy" && !!profileForCheck?.bestbuyCookies;
+
+        let inStock: boolean | null = null;
+        if (!skipFastCheck) {
+          try {
+            inStock = await fastCheckStock(task.site as Site, task.productUrl);
+          } catch {
+            inStock = null; // network hiccup — let browser decide
+          }
+        }
+
+        if (inStock === false) {
+          // Confirmed out of stock — skip browser entirely, wait 750ms, retry
+          await db.update(tasksTable).set({ lastRunAt: new Date(), updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
+          const now = Date.now();
+          if (now - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+            await addLog(taskId, "info", `🔍 Still scanning — ${checkCount} checks, no stock found`);
+            lastHeartbeatMs = now;
+          }
+          await new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, 750);
+            abortController.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+          });
+          continue;
+        }
+
+        if (inStock === true) {
+          await addLog(taskId, "info", "🟢 In stock detected — launching purchase flow now!");
+        }
+        // inStock === null → can't tell from HTTP, launch browser to be sure
+      }
+
+      // ── Full browser / API cycle ──────────────────────────────────────────
+      try {
+        await runBotCycle(taskId, abortController.signal);
+      } catch (err) {
+        logger.error({ err, taskId }, "Unhandled bot cycle error");
+        await addLog(taskId, "error", `Unexpected error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      if (!bot.running || abortController.signal.aborted) break;
+
+      // Check whether the task succeeded inside runBotCycle (it calls stopBot on success)
+      const [refreshed] = await db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).catch(() => [null]);
+      if (!refreshed || refreshed.status !== "running") break;
+
+      // Pause before next cycle:
+      //   Topps    → 5s   (Cloudflare + JS-heavy)
+      //   Best Buy → 2s   (cart API is the primary path now — no long Akamai cooldown needed)
+      //   Dick's   → 1.5s (no aggressive bot detection)
+      const pauseMs = refreshed.site === "topps" ? 5000 : refreshed.site === "bestbuy" ? 500 : 1500;
+      // Universal heartbeat — fires after every full cycle regardless of fast-check result
+      const hbNow = Date.now();
+      if (hbNow - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
+        await addLog(taskId, "info", `🔍 Still scanning — ${checkCount} cycles complete, no stock found`);
+        lastHeartbeatMs = hbNow;
+      }
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, pauseMs);
+        abortController.signal.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+      });
+    }
+
+    activeBots.delete(taskId);
+  }
+
+  loop().catch((err) => {
+    logger.error({ err, taskId }, "Bot loop fatal error");
+    activeBots.delete(taskId);
+  });
+}
+
+export function runDryRun(taskId: number): void {
+  // Fire a single dry-run cycle in the background (not a loop)
+  // Sets status to "testing" while running, back to "idle" when done.
+  db.select().from(tasksTable).where(eq(tasksTable.id, taskId)).then(async ([task]) => {
+    if (!task) return;
+    const [profile] = await db.select().from(profilesTable).where(eq(profilesTable.id, task.profileId));
+    if (!profile) {
+      await addLog(taskId, "error", "Profile not found — cannot run dry run");
+      await db.update(tasksTable).set({ status: "idle", updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
+      return;
+    }
+
+    const log = (level: string, message: string) => addLog(taskId, level, message);
+    const abortController = new AbortController();
+
+    await addLog(taskId, "info", "Starting dry run — will go through all checkout steps without placing an order...");
+
+    const botFn = task.site === "dicks"
+      ? runDicksBot
+      : task.site === "topps"
+        ? runToppsBot
+        : runBestBuyBot;
+
+    try {
+      await botFn(
+        {
+          id: task.id,
+          keywords: task.keywords,
+          productUrl: task.productUrl,
+          quantity: task.quantity,
+          dryRun: true,
+        },
+        {
+          email: profile.email,
+          password: profile.password,
+          firstName: profile.firstName,
+          lastName: profile.lastName,
+          phone: profile.phone,
+          address1: profile.address1,
+          address2: profile.address2,
+          city: profile.city,
+          state: profile.state,
+          zip: profile.zip,
+          cardNumber: profile.cardNumber,
+          cardExpiry: profile.cardExpiry,
+          cardCvv: profile.cardCvv,
+          cardName: profile.cardName,
+        },
+        log,
+        abortController.signal
+      );
+    } catch (err) {
+      logger.error({ err, taskId }, "Dry run error");
+      await addLog(taskId, "error", `Dry run error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      await db.update(tasksTable).set({ status: "idle", updatedAt: new Date() }).where(eq(tasksTable.id, taskId));
+    }
+  }).catch((err) => logger.error({ err, taskId }, "runDryRun setup error"));
+}
+
+export function stopBot(taskId: number): void {
+  const bot = activeBots.get(taskId);
+  if (bot) {
+    bot.running = false;
+    bot.abortController.abort();
+    activeBots.delete(taskId);
+    lastStoreCheckMap.delete(taskId);
+    purchasedQtyMap.delete(taskId);
+  }
+}
+
+export function isRunning(taskId: number): boolean {
+  return activeBots.has(taskId);
+}
